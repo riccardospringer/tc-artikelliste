@@ -37,7 +37,7 @@ _ADOBE_CLIENT_ID = os.environ.get("ADOBE_CLIENT_ID", "").strip()
 _ADOBE_CLIENT_SECRET = os.environ.get("ADOBE_CLIENT_SECRET", "").strip()
 _ADOBE_GLOBAL_COMPANY_ID = os.environ.get("ADOBE_GLOBAL_COMPANY_ID", "axelsp2").strip()
 _ADOBE_RSID = os.environ.get("ADOBE_RSID", "axelspringerbild").strip()
-_ADOBE_TOKEN_URL = os.environ.get("ADOBE_TOKEN_URL", "https://ims-na1.adobelogin.com/ims/token/v2").strip()
+_ADOBE_TOKEN_URL = os.environ.get("ADOBE_TOKEN_URL", "https://ims-na1.adobelogin.com/ims/token/v3").strip()
 _ADOBE_BASE_URL = os.environ.get("ADOBE_ANALYTICS_BASE_URL", "https://analytics.adobe.io").strip()
 _ADOBE_DATE_RANGE_DAYS = max(1, int(os.environ.get("ADOBE_DATE_RANGE_DAYS", "7") or "7"))
 _ADOBE_LIVE_READERS_METRIC = os.environ.get("ADOBE_LIVE_READERS_METRIC", "metrics/pageviews").strip()
@@ -142,6 +142,15 @@ def get_access_token(force: bool = False) -> str:
             _last_success_ts = time.time()
             _last_error = ""
             return token
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            raw_msg = f"HTTP {exc.code} {exc.reason}: {body}"
+            _last_error = raw_msg.replace(_ADOBE_CLIENT_SECRET, "***") if _ADOBE_CLIENT_SECRET else raw_msg
+            raise RuntimeError(f"Adobe Token-Fehler: {_last_error}") from exc
         except Exception as exc:
             _last_error = str(exc).replace(_ADOBE_CLIENT_SECRET, "***") if _ADOBE_CLIENT_SECRET else str(exc)
             raise RuntimeError(f"Adobe Token-Fehler: {_last_error}") from exc
@@ -178,7 +187,12 @@ def _request(method: str, path: str, body: dict | None = None) -> Any:
                 _last_success_ts = time.time()
                 _last_error = ""
                 return result
-        _last_error = f"HTTP {exc.code}: {exc.reason}"
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        _last_error = f"HTTP {exc.code} {exc.reason}: {body}"
         raise
 
 
@@ -226,6 +240,48 @@ def fetch_live_readers(canonical_urls: list[str]) -> dict[str, int]:
             val = row.get("data", [0])
             out[dim] = int(val[0]) if val else 0
     return out
+
+
+def test_auth() -> dict[str, object]:
+    """Testet Adobe-Auth und eine minimale Analytics-Abfrage. Sicher: keine Secrets in Ausgabe."""
+    result: dict[str, object] = {
+        "configured": _is_configured() and _is_mapping_complete(),
+        "tokenOk": False,
+        "tokenError": None,
+        "apiOk": False,
+        "apiError": None,
+        "apiRowCount": None,
+        "tokenUrl": _ADOBE_TOKEN_URL,
+        "globalCompanyId": _ADOBE_GLOBAL_COMPANY_ID,
+        "reportSuiteId": _ADOBE_RSID,
+        "articleDimension": _ADOBE_ARTICLE_DIMENSION,
+    }
+    if not _is_configured():
+        result["tokenError"] = "ADOBE_CLIENT_SECRET nicht gesetzt"
+        return result
+    try:
+        get_access_token(force=True)
+        result["tokenOk"] = True
+    except Exception as exc:
+        result["tokenError"] = str(exc)
+        return result
+    # Minimale Analytics-Abfrage: einen Artikel-Eintrag holen
+    try:
+        today = _days_ago(0)
+        body = {
+            "rsid": _ADOBE_RSID,
+            "globalFilters": [{"type": "dateRange", "dateRange": f"{today}T00:00:00.000/{today}T23:59:59.000"}],
+            "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
+            "dimension": _ADOBE_ARTICLE_DIMENSION,
+            "settings": {"countRepeatInstances": True, "limit": 1, "nonesBehavior": "exclude-nones"},
+        }
+        resp = _request("POST", "/reports?locale=de_DE", body)
+        rows = resp.get("rows", [])
+        result["apiOk"] = True
+        result["apiRowCount"] = len(rows)
+    except Exception as exc:
+        result["apiError"] = str(exc)
+    return result
 
 
 def fetch_actual_conversions(canonical_urls: list[str], days: int | None = None) -> dict[str, int | None]:

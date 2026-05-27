@@ -304,6 +304,10 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
     header {{ background: #d0021b; color: #fff; padding: 10px 16px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }}
     header h1 {{ font-size: 16px; font-weight: 700; letter-spacing: .5px; white-space: nowrap; }}
     .toolbar {{ background: #fff; border-bottom: 1px solid #ddd; padding: 8px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+    #adobe-banner {{ display:none; padding: 8px 16px; font-size: 12px; border-bottom: 2px solid; }}
+    #adobe-banner.error {{ background: #fdecea; color: #c62828; border-color: #c62828; }}
+    #adobe-banner.warn {{ background: #fff8e1; color: #7f6000; border-color: #f9a825; }}
+    #adobe-banner.ok {{ background: #e8f5e9; color: #1b5e20; border-color: #388e3c; }}
     .toolbar input {{ height: 30px; padding: 0 8px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px; min-width: 200px; }}
     .toolbar select {{ height: 30px; padding: 0 6px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px; }}
     .btn {{ height: 30px; padding: 0 12px; border: 1px solid #ccc; border-radius: 3px; background: #fff; font-size: 12px; cursor: pointer; white-space: nowrap; }}
@@ -348,6 +352,7 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
 </head>
 <body>
   {top_banner}
+  <div id="adobe-banner"></div>
   <header>
     <h1>Textchefs Artikelliste</h1>
     <div class="share-row">
@@ -441,6 +446,7 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
     let showTop20 = false;
     let refreshTimer = null;
     let countdown = 60;
+    let adobeActive = false; // true sobald tokenStatus=ok
 
     // ── DOM refs ───────────────────────────────────────────────────────────
     const tbody = document.getElementById('tbody');
@@ -521,13 +527,17 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
           ? `<span class="home-badge">Pos. ${{a.home_position}}</span>`
           : '<span style="color:#aaa">—</span>';
         const sources = (a.source_flags || []).join(', ');
+        const readersVal = a.live_readers;
+        const readersHtml = adobeActive
+          ? (readersVal != null ? Number(readersVal).toLocaleString('de-DE') : '<span style="color:#aaa">n.v.</span>')
+          : '<span style="color:#aaa" title="Adobe Analytics nicht aktiv">n.v.</span>';
         return `<tr class="${{isTop5 ? 'top5' : ''}}">
           <td class="rank">${{rank}}</td>
           <td class="score"><span class="score-badge ${{scoreClass(score)}}">${{score}}</span></td>
           <td class="title"><a href="${{esc(url)}}" target="_blank" rel="noopener">${{esc(title)}}</a></td>
           <td class="url"><a href="${{esc(url)}}" target="_blank" rel="noopener">${{esc(url)}}</a></td>
           <td><span class="status-pill${{statusCls}}">${{esc(statusLabel)}}</span></td>
-          <td class="readers">${{(a.live_readers || 0).toLocaleString('de-DE')}}</td>
+          <td class="readers">${{readersHtml}}</td>
           <td class="homepos">${{homeHtml}}</td>
           <td class="ressort">${{esc(a.ressort || '')}}</td>
           <td class="published">${{fmtDate(a.published_at)}}</td>
@@ -535,6 +545,51 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
         </tr>`;
       }}).join('');
       tbody.innerHTML = html;
+    }}
+
+    // ── Adobe status banner ────────────────────────────────────────────────
+    const adobeBanner = document.getElementById('adobe-banner');
+
+    function updateAdobeBanner(h) {{
+      const adobe = h && h.adobe;
+      if (!adobe) {{ adobeBanner.style.display = 'none'; return; }}
+      const ts = adobe.adobeTokenStatus;
+      const err = adobe.adobeLastError;
+      const total = h.articlesTotal;
+      const withAdobe = h.articlesWithAdobeLiveReaders;
+      adobeActive = ts === 'ok';
+      if (ts === 'ok') {{
+        const parts = ['Adobe Analytics: verbunden'];
+        if (typeof withAdobe === 'number' && typeof total === 'number') {{
+          parts.push(`${{withAdobe}} von ${{total}} Artikeln mit Live-Leser-Wert`);
+        }}
+        adobeBanner.className = 'ok';
+        adobeBanner.textContent = parts.join(' · ');
+        adobeBanner.style.display = '';
+      }} else if (ts === 'error') {{
+        adobeBanner.className = 'error';
+        adobeBanner.textContent = 'Adobe Analytics: Fehler' + (err ? ' – ' + err : '');
+        adobeBanner.style.display = '';
+      }} else if (ts === 'configured_untested') {{
+        adobeBanner.className = 'warn';
+        adobeBanner.textContent = 'Adobe Analytics: konfiguriert, aber noch nicht erfolgreich getestet';
+        adobeBanner.style.display = '';
+      }} else if (!adobe.adobeConfigured) {{
+        adobeBanner.className = 'warn';
+        adobeBanner.textContent = 'Adobe Analytics: nicht konfiguriert – Live-Leser-Werte nicht verfügbar';
+        adobeBanner.style.display = '';
+      }} else {{
+        adobeBanner.style.display = 'none';
+      }}
+    }}
+
+    function loadHealthz() {{
+      const healthUrl = resolveUrl({json.dumps(health_path)});
+      fetch(healthUrl).then(r => r.ok ? r.json() : null).then(h => {{
+        if (!h) return;
+        updateAdobeBanner(h);
+        render(); // re-render Tabelle mit korrektem adobeActive-Flag
+      }}).catch(() => {{}});
     }}
 
     // ── Data load ──────────────────────────────────────────────────────────
@@ -623,6 +678,7 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
       document.getElementById('json-link').style.display = 'none';
       document.getElementById('refresh-btn').style.display = 'none';
     }} else {{
+      loadHealthz();
       loadData(false);
     }}
   </script>
@@ -770,6 +826,8 @@ class Handler(BaseHTTPRequestHandler):
         route_path = _path_from_request(path)
 
         if route_path == "/healthz":
+            cached = _CACHE_DATA or []
+            articles_with_readers = sum(1 for a in cached if (a.get("live_readers") or 0) > 0)
             self._send_json(
                 {
                     "status": "ok",
@@ -789,6 +847,10 @@ class Handler(BaseHTTPRequestHandler):
                     "editorial_one_strict": EDITORIAL_ONE_STRICT,
                     "editorial_one_hours": EDITORIAL_ONE_HOURS if EDITORIAL_ONE_ENABLED else None,
                     "editorial_one_limit": EDITORIAL_ONE_LIMIT if EDITORIAL_ONE_ENABLED else None,
+                    "articlesTotal": len(cached),
+                    "articlesWithAdobeLiveReaders": articles_with_readers,
+                    "articlesMissingAdobeLiveReaders": len(cached) - articles_with_readers,
+                    "liveReadersMissingShownAsZero": False,
                 }
             )
             return
@@ -801,6 +863,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "data_load_failed", "message": str(exc)}, status=502)
                 return
             self._send_json(data)
+            return
+
+        if route_path == "/api/admin/adobe/test":
+            if not _ADOBE_AVAILABLE:
+                self._send_json({"error": "adobe_module_unavailable"}, status=503)
+                return
+            result = _adobe.test_auth()
+            self._send_json(result)
             return
 
         if route_path == "/api/export/csv":
@@ -845,6 +915,32 @@ class Handler(BaseHTTPRequestHandler):
                     no_sources_state=NO_SOURCES_STATE,
                 )
             )
+            return
+
+        self._send_json({"error": "not_found"}, status=404)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = _normalize_request_path(parsed.path)
+        route_path = _path_from_request(path)
+
+        if route_path == "/api/admin/refresh":
+            try:
+                data = load_articles(force_refresh=True)
+            except Exception as exc:
+                self._send_json({"error": "refresh_failed", "message": str(exc)}, status=502)
+                return
+            adobe_status: dict[str, object] = {}
+            if _ADOBE_AVAILABLE:
+                adobe_status = _adobe.get_adobe_status()
+            articles_with_readers = sum(1 for a in data if (a.get("live_readers") or 0) > 0)
+            self._send_json({
+                "refreshed": True,
+                "articlesTotal": len(data),
+                "articlesWithAdobeLiveReaders": articles_with_readers,
+                "articlesMissingAdobeLiveReaders": len(data) - articles_with_readers,
+                "adobe": adobe_status,
+            })
             return
 
         self._send_json({"error": "not_found"}, status=404)
