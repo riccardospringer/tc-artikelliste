@@ -61,8 +61,8 @@ def test_live_connector_retries_with_backoff(monkeypatch) -> None:
         def __exit__(self, exc_type, exc, tb) -> None:
             return None
 
-    def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
-        _ = (request, timeout)
+    def fake_urlopen(request, timeout, **kwargs):  # type: ignore[no-untyped-def]
+        _ = (request, timeout, kwargs)
         calls["count"] += 1
         if calls["count"] < 3:
             raise URLError("temporary")
@@ -110,8 +110,8 @@ def test_api_check_retries_http_sources(monkeypatch) -> None:
         def __exit__(self, exc_type, exc, tb) -> None:
             return None
 
-    def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
-        _ = timeout
+    def fake_urlopen(request, timeout, **kwargs):  # type: ignore[no-untyped-def]
+        _ = (timeout, kwargs)
         url = request.full_url
         if "adobe" in url:
             calls["adobe"] += 1

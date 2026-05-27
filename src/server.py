@@ -15,6 +15,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from article_list_mvp import canonicalize_url, run_mvp
+try:
+    import adobe_client as _adobe
+    _ADOBE_AVAILABLE = True
+except ImportError:
+    _adobe = None  # type: ignore[assignment]
+    _ADOBE_AVAILABLE = False
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 ADOBE = BASE_DIR / "fixtures" / "adobe_sample.json"
@@ -682,6 +688,12 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
         if _no_sources_now:
             return []
 
+        # Im real-data-mode keine Fixture-Quellen laden — verhindert Mischung.
+        # Fixture-Quellen nur wenn FIXTURE_MODE_EXPLICIT gesetzt ist.
+        _adobe_src = ADOBE_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(ADOBE_SOURCE)) else None
+        _rss_src = RSS_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(RSS_SOURCE)) else None
+        _home_src = HOME_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(HOME_SOURCE)) else None
+
         if EDITORIAL_ONE_ENABLED:
             try:
                 editorial_one_data = _load_editorial_one_articles(force_refresh=force_refresh)
@@ -691,27 +703,40 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
                     raise RuntimeError("Editorial-One lieferte keine Artikel")
                 else:
                     data = run_mvp(
-                        adobe_file=ADOBE_SOURCE,
-                        rss_file=RSS_SOURCE,
-                        home_file=HOME_SOURCE,
+                        adobe_file=_adobe_src,
+                        rss_file=_rss_src,
+                        home_file=_home_src,
                         api_check=API_CHECK,
                     )
             except Exception:
                 if EDITORIAL_ONE_STRICT:
                     raise
                 data = run_mvp(
-                    adobe_file=ADOBE_SOURCE,
-                    rss_file=RSS_SOURCE,
-                    home_file=HOME_SOURCE,
+                    adobe_file=_adobe_src,
+                    rss_file=_rss_src,
+                    home_file=_home_src,
                     api_check=API_CHECK,
                 )
         else:
             data = run_mvp(
-                adobe_file=ADOBE_SOURCE,
-                rss_file=RSS_SOURCE,
-                home_file=HOME_SOURCE,
+                adobe_file=_adobe_src,
+                rss_file=_rss_src,
+                home_file=_home_src,
                 api_check=API_CHECK,
             )
+        # Adobe Live-Reader-Enrichment: live_readers überschreiben wenn Adobe konfiguriert
+        if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
+            try:
+                urls = [a.get("canonical_url", "") for a in data if a.get("canonical_url")]
+                reader_map = _adobe.fetch_live_readers(urls)
+                if reader_map:
+                    for a in data:
+                        url = a.get("canonical_url", "")
+                        if url in reader_map:
+                            a["live_readers"] = reader_map[url]
+            except Exception:
+                pass  # Adobe-Fehler → bestehende live_readers beibehalten
+
         if CACHE_SECONDS > 0:
             _CACHE_DATA = data
             _CACHE_EXPIRES_AT = time.monotonic() + CACHE_SECONDS
@@ -759,6 +784,7 @@ class Handler(BaseHTTPRequestHandler):
                     "fixture_mode_active": FIXTURE_MODE_ACTIVE,
                     "fixture_mode_explicit": FIXTURE_MODE_EXPLICIT,
                     "no_sources_state": NO_SOURCES_STATE,
+                    "adobe": _adobe.get_adobe_status() if _ADOBE_AVAILABLE else {"adobeConfigured": False},
                     "editorial_one_enabled": EDITORIAL_ONE_ENABLED,
                     "editorial_one_strict": EDITORIAL_ONE_STRICT,
                     "editorial_one_hours": EDITORIAL_ONE_HOURS if EDITORIAL_ONE_ENABLED else None,

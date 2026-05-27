@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import ssl
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -12,6 +13,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
+
+try:
+    import certifi as _certifi
+    _SSL_CTX: ssl.SSLContext | None = ssl.create_default_context(cafile=_certifi.where())
+except ImportError:
+    _SSL_CTX = None
 
 EXCLUDED_WORKFLOW_STATUSES = {"zum verbauen", "redigiert"}
 
@@ -268,11 +275,13 @@ def _read_with_retry(
             request = Request(
                 url,
                 headers={
-                    "User-Agent": "textchefs-artikelliste/1.0",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                     "Accept": "application/json, application/xml, text/xml;q=0.9, */*;q=0.8",
+                    "Accept-Language": "de-DE,de;q=0.9",
                 },
             )
-            with urlopen(request, timeout=config.timeout_seconds) as response:
+            kw = {"context": _SSL_CTX} if _SSL_CTX else {}
+            with urlopen(request, timeout=config.timeout_seconds, **kw) as response:
                 payload = response.read()
                 return payload.decode(response.headers.get_content_charset() or "utf-8")
         except (URLError, TimeoutError, OSError, ValueError) as exc:
@@ -295,21 +304,24 @@ def _probe_http_source(
     attempts = max(config.max_retries, 0) + 1
     last_error: Exception | None = None
     headers = {
-        "User-Agent": "textchefs-artikelliste/1.0",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "application/json, application/xml, text/xml;q=0.9, */*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9",
     }
 
     for attempt in range(attempts):
         try:
             try:
                 request = Request(url, method="HEAD", headers=headers)
-                with urlopen(request, timeout=config.timeout_seconds) as response:
+                kw = {"context": _SSL_CTX} if _SSL_CTX else {}
+                with urlopen(request, timeout=config.timeout_seconds, **kw) as response:
                     _ = response.status
             except HTTPError as head_error:
                 if head_error.code not in {405, 501}:
                     raise
                 request = Request(url, method="GET", headers={**headers, "Range": "bytes=0-0"})
-                with urlopen(request, timeout=config.timeout_seconds) as response:
+                kw = {"context": _SSL_CTX} if _SSL_CTX else {}
+                with urlopen(request, timeout=config.timeout_seconds, **kw) as response:
                     response.read(1)
             return
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
@@ -363,6 +375,35 @@ def load_adobe(source: Path | str, config: ConnectorConfig | None = None) -> lis
     return rows
 
 
+_SITEMAP_NS = {
+    "s": "http://www.sitemaps.org/schemas/sitemap/0.9",
+    "news": "http://www.google.com/schemas/sitemap-news/0.9",
+}
+
+
+def _parse_sitemap_xml(xml_text: str) -> list[dict[str, Any]]:
+    """Parst Google News Sitemap XML (sitemap-news.xml) in RSS-kompatible Rows."""
+    root = ET.fromstring(xml_text)
+    local = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+    if local not in ("urlset", "sitemapindex"):
+        return []
+    items: list[dict[str, Any]] = []
+    for url_el in root.findall("s:url", _SITEMAP_NS):
+        loc = (url_el.findtext("s:loc", "", _SITEMAP_NS) or "").strip()
+        if not loc:
+            continue
+        news_el = url_el.find("news:news", _SITEMAP_NS)
+        title = ""
+        pub_date = ""
+        if news_el is not None:
+            title = (news_el.findtext("news:title", "", _SITEMAP_NS) or "").strip()
+            pub_date = (news_el.findtext("news:publication_date", "", _SITEMAP_NS) or "").strip()
+        if not pub_date:
+            pub_date = (url_el.findtext("s:lastmod", "", _SITEMAP_NS) or "").strip()
+        items.append({"link": loc, "url": loc, "title": title, "pubDate": pub_date})
+    return items
+
+
 def load_rss(source: Path | str, config: ConnectorConfig | None = None) -> list[dict[str, Any]]:
     cfg = config or ConnectorConfig()
     if _is_json_source(source):
@@ -375,6 +416,10 @@ def load_rss(source: Path | str, config: ConnectorConfig | None = None) -> list[
 
     xml_text = _read_with_retry(source, config=cfg)
     root = ET.fromstring(xml_text)
+    local_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+    # Sitemap-Format (sitemap-news.xml) statt RSS
+    if local_tag in ("urlset", "sitemapindex"):
+        return _parse_sitemap_xml(xml_text)
     items: list[dict[str, Any]] = []
     for item in root.findall(".//item"):
         items.append(_xml_item_to_row(item))
@@ -541,20 +586,20 @@ def build_prioritized_article_list(
 
 
 def run_mvp(
-    adobe_file: Path | str,
-    rss_file: Path | str,
-    home_file: Path | str,
+    adobe_file: Path | str | None,
+    rss_file: Path | str | None,
+    home_file: Path | str | None,
     out_file: Path | None = None,
     connector_config: ConnectorConfig | None = None,
     api_check: bool = False,
 ) -> list[dict[str, Any]]:
     cfg = connector_config or ConnectorConfig()
-    if api_check:
+    if api_check and adobe_file and rss_file:
         check_live_connector_apis(adobe_file, rss_file, config=cfg)
 
-    adobe = load_adobe(adobe_file, config=cfg)
-    rss = load_rss(rss_file, config=cfg)
-    home = load_home_positions(home_file, config=cfg)
+    adobe = load_adobe(adobe_file, config=cfg) if adobe_file else []
+    rss = load_rss(rss_file, config=cfg) if rss_file else []
+    home = load_home_positions(home_file, config=cfg) if home_file else []
 
     ranked = build_prioritized_article_list(adobe, rss, home)
     result = [r.to_dict() for r in ranked]
