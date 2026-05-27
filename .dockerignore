@@ -1,0 +1,10 @@
+.git
+.gitignore
+.pytest_cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+tests/
+README.md
+run_local.sh

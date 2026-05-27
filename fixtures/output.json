@@ -1,0 +1,46 @@
+[
+  {
+    "canonical_url": "https://bild.de/sport/fussball/test-c-777777",
+    "source_url": "https://www.bild.de/sport/fussball/test-c-777777",
+    "cms_id": "777777",
+    "title": "Artikel C",
+    "workflow_status": "freigegeben",
+    "live_readers": 900,
+    "home_position": 1,
+    "published_at": "2026-04-15T08:10:00+00:00",
+    "source_flags": [
+      "adobe",
+      "home",
+      "rss"
+    ]
+  },
+  {
+    "canonical_url": "https://bild.de/politik/inland/test-a-123456",
+    "source_url": "https://www.bild.de/politik/inland/test-a-123456",
+    "cms_id": "123456",
+    "title": "Artikel A",
+    "workflow_status": "freigegeben",
+    "live_readers": 1400,
+    "home_position": 2,
+    "published_at": "2026-04-15T08:00:00+00:00",
+    "source_flags": [
+      "adobe",
+      "home",
+      "rss"
+    ]
+  },
+  {
+    "canonical_url": "https://bild.de/wirtschaft/test-e-999999",
+    "source_url": "https://www.bild.de/wirtschaft/test-e-999999",
+    "cms_id": "999999",
+    "title": "Artikel E",
+    "workflow_status": "",
+    "live_readers": 0,
+    "home_position": 3,
+    "published_at": "2026-04-15T08:11:00+00:00",
+    "source_flags": [
+      "home",
+      "rss"
+    ]
+  }
+]

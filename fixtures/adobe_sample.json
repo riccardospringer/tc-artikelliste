@@ -1,0 +1,34 @@
+[
+  {
+    "url": "https://www.bild.de/politik/inland/test-a-123456",
+    "cms_id": "123456",
+    "title": "Artikel A",
+    "workflow_status": "freigegeben",
+    "live_readers": 1400,
+    "published_at": "2026-04-15T08:00:00Z"
+  },
+  {
+    "url": "https://www.bild.de/news/vermischtes/test-b-654321?utm_source=hp",
+    "cms_id": "654321",
+    "title": "Artikel B",
+    "workflow_status": "zum verbauen",
+    "live_readers": 2200,
+    "published_at": "2026-04-15T07:55:00Z"
+  },
+  {
+    "url": "https://www.bild.de/sport/fussball/test-c-777777",
+    "cms_id": "777777",
+    "title": "Artikel C",
+    "workflow_status": "freigegeben",
+    "live_readers": 900,
+    "published_at": "2026-04-15T08:10:00Z"
+  },
+  {
+    "url": "https://www.bild.de/news/panorama/test-d-888888",
+    "cms_id": "888888",
+    "title": "Artikel D",
+    "workflow_status": "redigiert",
+    "live_readers": 3100,
+    "published_at": "2026-04-15T08:02:00Z"
+  }
+]

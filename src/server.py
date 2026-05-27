@@ -1,0 +1,795 @@
+from __future__ import annotations
+
+import asyncio
+import csv
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from article_list_mvp import canonicalize_url, run_mvp
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+ADOBE = BASE_DIR / "fixtures" / "adobe_sample.json"
+RSS = BASE_DIR / "fixtures" / "rss_sample.xml"
+HOME = BASE_DIR / "fixtures" / "home_positions_sample.json"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw.strip())
+    except ValueError:
+        return default
+    return max(parsed, minimum)
+
+
+def _parse_optional_port(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        return max(int(value), 1)
+    except ValueError:
+        return None
+
+
+def _resolve_listen_port() -> tuple[int, str]:
+    tc_port = _parse_optional_port(os.environ.get("TC_PORT"))
+    if tc_port is not None:
+        return tc_port, "TC_PORT"
+
+    platform_port = _parse_optional_port(os.environ.get("PORT"))
+    if platform_port is not None:
+        return platform_port, "PORT"
+
+    return 8099, "default"
+
+
+def _env_source(name: str, default_path: Path) -> Path | str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default_path
+    return value
+
+
+def _normalize_base_path(path: str) -> str:
+    value = path.strip()
+    if not value:
+        return "/"
+    parts = [part for part in value.split("/") if part]
+    if not parts:
+        return "/"
+    return "/" + "/".join(parts)
+
+
+def _normalize_public_base_url(url: str | None) -> str | None:
+    if url is None:
+        return None
+    value = url.strip()
+    if not value:
+        return None
+    return value.rstrip("/")
+
+
+def _normalize_request_path(path: str) -> str:
+    if not path:
+        return "/"
+    return _normalize_base_path(path)
+
+
+def _with_base_path(path: str, *, base_path: str | None = None) -> str:
+    target_base_path = BASE_PATH if base_path is None else base_path
+    if target_base_path == "/":
+        return path
+    return f"{target_base_path}{path}"
+
+
+def _public_url(path: str) -> str | None:
+    if PUBLIC_BASE_URL is None:
+        return None
+    if path == "/":
+        return f"{PUBLIC_BASE_URL}/"
+    return f"{PUBLIC_BASE_URL}{path}"
+
+
+def _path_from_request(request_path: str) -> str:
+    normalized_path = _normalize_request_path(request_path)
+    if BASE_PATH == "/":
+        return normalized_path
+    if normalized_path == BASE_PATH:
+        return "/"
+    prefix = f"{BASE_PATH}/"
+    if normalized_path.startswith(prefix):
+        suffix = normalized_path[len(prefix) :].lstrip("/")
+        return f"/{suffix}" if suffix else "/"
+    # Unterstützt Reverse-Proxys, die den Prefix bereits vor Weiterleitung entfernen.
+    return normalized_path
+
+
+def _base_path_for_links(request_path: str) -> str:
+    if BASE_PATH == "/":
+        return "/"
+    normalized_path = _normalize_request_path(request_path)
+    if normalized_path == BASE_PATH or normalized_path.startswith(f"{BASE_PATH}/"):
+        return BASE_PATH
+    return "/"
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _find_pyc_module(pycache_dir: Path, module_name: str) -> Path | None:
+    matches = sorted(pycache_dir.glob(f"{module_name}.cpython-*.pyc"))
+    if not matches:
+        return None
+    return matches[0]
+
+
+def _load_sourceless_module(module_name: str, module_path: Path):
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+
+    loader = importlib.machinery.SourcelessFileLoader(module_name, str(module_path))
+    spec = importlib.util.spec_from_loader(module_name, loader)
+    if spec is None:
+        raise RuntimeError(f"Sourceless-Spec konnte nicht geladen werden: {module_name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+def _load_editorial_one_module():
+    global _EDITORIAL_ONE_MODULE
+
+    if _EDITORIAL_ONE_MODULE is not None:
+        return _EDITORIAL_ONE_MODULE
+
+    with _EDITORIAL_ONE_MODULE_LOCK:
+        if _EDITORIAL_ONE_MODULE is not None:
+            return _EDITORIAL_ONE_MODULE
+
+        pyc_path = Path(EDITORIAL_ONE_PYC)
+        if not pyc_path.is_file():
+            raise FileNotFoundError(f"Editorial-One Modul nicht gefunden: {pyc_path}")
+
+        pycache_dir = pyc_path.parent
+        for dependency in ("config", "utils", "adobe_client", "db", "schemas", "data_pipeline", "seed_articles"):
+            dep_path = _find_pyc_module(pycache_dir, dependency)
+            if dep_path is None:
+                continue
+            _load_sourceless_module(dependency, dep_path)
+
+        _EDITORIAL_ONE_MODULE = _load_sourceless_module("bild_published", pyc_path)
+        return _EDITORIAL_ONE_MODULE
+
+
+def _map_editorial_one_row(row: dict[str, object]) -> dict[str, object] | None:
+    url = str(row.get("url") or row.get("source_url") or "").strip()
+    canonical_url = canonicalize_url(url)
+    if not canonical_url:
+        return None
+
+    home_raw = row.get("home_position")
+    if home_raw in (None, ""):
+        home_raw = row.get("_rank_home")
+    home_position = _safe_int(home_raw, default=0)
+    if home_position <= 0 or home_position >= 9999:
+        home_position_value: int | None = None
+    else:
+        home_position_value = home_position
+
+    live_readers = _safe_int(row.get("adobe_readers"), default=0)
+    if live_readers <= 0:
+        live_readers = _safe_int(row.get("live_readers"), default=0)
+    if live_readers <= 0:
+        live_readers = abs(_safe_int(row.get("_rank_readers"), default=0))
+
+    published = row.get("published") or row.get("published_at")
+    published_at: str | None
+    if published is None:
+        published_at = None
+    elif hasattr(published, "isoformat"):
+        published_at = published.isoformat()  # type: ignore[union-attr]
+    else:
+        published_at = str(published)
+
+    source_flags = {"editorial_one", "rss"}
+    if home_position_value is not None:
+        source_flags.add("home")
+    if live_readers > 0:
+        source_flags.add("adobe")
+
+    return {
+        "canonical_url": canonical_url,
+        "source_url": url,
+        "title": str(row.get("title") or ""),
+        "workflow_status": str(row.get("workflow_status") or ""),
+        "live_readers": live_readers,
+        "home_position": home_position_value,
+        "published_at": published_at,
+        "source_flags": sorted(source_flags),
+    }
+
+
+def _load_editorial_one_articles(force_refresh: bool = False) -> list[dict[str, object]]:
+    module = _load_editorial_one_module()
+    get_fetcher = getattr(module, "get_bild_published_fetcher", None)
+    if not callable(get_fetcher):
+        raise RuntimeError("Editorial-One Modul liefert keinen get_bild_published_fetcher()")
+
+    fetcher = get_fetcher()
+    get_list = getattr(fetcher, "get_published_list", None)
+    if not callable(get_list):
+        raise RuntimeError("Editorial-One Fetcher liefert keinen get_published_list()")
+
+    async def _fetch() -> list[dict[str, object]]:
+        rows = await get_list(
+            hours=EDITORIAL_ONE_HOURS,
+            limit=EDITORIAL_ONE_LIMIT,
+            force_refresh=force_refresh,
+        )
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    raw_rows = asyncio.run(_fetch())
+    mapped_rows: list[dict[str, object]] = []
+    for row in raw_rows:
+        mapped = _map_editorial_one_row(row)
+        if mapped is not None:
+            mapped_rows.append(mapped)
+    return mapped_rows
+
+
+def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path: str = "") -> str:
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Textchefs Artikelliste</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13px; background: #f5f5f5; color: #1a1a1a; }}
+    header {{ background: #d0021b; color: #fff; padding: 10px 16px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }}
+    header h1 {{ font-size: 16px; font-weight: 700; letter-spacing: .5px; white-space: nowrap; }}
+    .toolbar {{ background: #fff; border-bottom: 1px solid #ddd; padding: 8px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+    .toolbar input {{ height: 30px; padding: 0 8px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px; min-width: 200px; }}
+    .toolbar select {{ height: 30px; padding: 0 6px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px; }}
+    .btn {{ height: 30px; padding: 0 12px; border: 1px solid #ccc; border-radius: 3px; background: #fff; font-size: 12px; cursor: pointer; white-space: nowrap; }}
+    .btn:hover {{ background: #f0f0f0; }}
+    .btn-primary {{ background: #d0021b; color: #fff; border-color: #b50218; }}
+    .btn-primary:hover {{ background: #b50218; }}
+    .status-bar {{ font-size: 11px; color: #666; margin-left: auto; white-space: nowrap; }}
+    .table-wrap {{ overflow-x: auto; padding: 0 16px 16px; }}
+    table {{ width: 100%; border-collapse: collapse; background: #fff; margin-top: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+    thead th {{ background: #1a1a1a; color: #fff; padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 600; white-space: nowrap; cursor: pointer; user-select: none; position: sticky; top: 0; z-index: 1; }}
+    thead th:hover {{ background: #333; }}
+    thead th .sort-arrow {{ margin-left: 4px; opacity: .5; }}
+    thead th.sorted .sort-arrow {{ opacity: 1; }}
+    tbody tr {{ border-bottom: 1px solid #eee; }}
+    tbody tr:hover {{ background: #fafafa; }}
+    tbody tr.top5 {{ border-left: 3px solid #d0021b; }}
+    td {{ padding: 7px 10px; vertical-align: top; }}
+    td.rank {{ font-weight: 700; color: #888; font-size: 12px; min-width: 32px; }}
+    td.score {{ min-width: 52px; }}
+    .score-badge {{ display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 700; color: #fff; }}
+    .score-high {{ background: #d0021b; }}
+    .score-med {{ background: #e67e00; }}
+    .score-low {{ background: #888; }}
+    td.title {{ max-width: 280px; }}
+    td.title a {{ color: #1a1a1a; text-decoration: none; font-weight: 500; word-break: break-word; }}
+    td.title a:hover {{ color: #d0021b; text-decoration: underline; }}
+    td.url {{ max-width: 200px; }}
+    td.url a {{ color: #555; font-size: 11px; word-break: break-all; }}
+    td.url a:hover {{ color: #d0021b; }}
+    .status-pill {{ display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 500; background: #e8f5e9; color: #1b5e20; }}
+    .status-pill.unknown {{ background: #fff3e0; color: #7f4f00; }}
+    td.readers {{ min-width: 70px; font-variant-numeric: tabular-nums; }}
+    td.homepos {{ min-width: 60px; text-align: center; }}
+    .home-badge {{ display: inline-block; padding: 2px 6px; border-radius: 3px; background: #e3f2fd; color: #0d47a1; font-size: 11px; font-weight: 600; }}
+    td.ressort {{ min-width: 90px; }}
+    td.published {{ min-width: 100px; font-size: 11px; color: #555; white-space: nowrap; }}
+    td.sources {{ font-size: 10px; color: #888; }}
+    .empty {{ text-align: center; padding: 40px; color: #888; }}
+    .share-row {{ font-size: 11px; color: #ddd; display: flex; align-items: center; gap: 8px; }}
+    .share-row a {{ color: #fff; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Textchefs Artikelliste</h1>
+    <div class="share-row">
+      Share: <a id="share-link" href="{ui_path}">{ui_path}</a>
+      <button class="btn btn-primary" id="copy-share-link" type="button" style="height:24px;padding:0 8px;font-size:11px;">Link kopieren</button>
+      <span id="copy-status" aria-live="polite"></span>
+      &nbsp;·&nbsp;<a id="health-link" href="{health_path}" style="font-size:10px;color:#eee;">health</a>
+    </div>
+  </header>
+  <div class="toolbar">
+    <input type="search" id="search" placeholder="Suche nach Titel oder URL…" autocomplete="off">
+    <select id="filter-ressort"><option value="">Alle Ressorts</option></select>
+    <select id="filter-home">
+      <option value="">Alle</option>
+      <option value="on">Auf der Home</option>
+      <option value="off">Nicht auf der Home</option>
+    </select>
+    <button class="btn" id="toggle-top20">Nur Top 20</button>
+    <button class="btn btn-primary" id="refresh-btn">Neu laden</button>
+    <a class="btn" id="csv-link" href="{csv_path}" download="tc_artikelliste.csv">CSV Export</a>
+    <a class="btn" id="json-link" href="{api_path}" target="_blank">JSON</a>
+    <div class="status-bar" id="status-bar">lade…</div>
+  </div>
+  <div class="table-wrap">
+    <table id="main-table">
+      <thead>
+        <tr>
+          <th data-col="rank">#<span class="sort-arrow"></span></th>
+          <th data-col="urgency_score">Score<span class="sort-arrow"></span></th>
+          <th data-col="title">Titel<span class="sort-arrow"></span></th>
+          <th data-col="url">URL<span class="sort-arrow"></span></th>
+          <th data-col="workflow_status">Status<span class="sort-arrow"></span></th>
+          <th data-col="live_readers">Live-Leser<span class="sort-arrow"></span></th>
+          <th data-col="home_position">Home-Pos.<span class="sort-arrow"></span></th>
+          <th data-col="ressort">Ressort<span class="sort-arrow"></span></th>
+          <th data-col="published_at">Veröffentlicht<span class="sort-arrow"></span></th>
+          <th data-col="source_flags">Quellen<span class="sort-arrow"></span></th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="empty" id="empty-msg" style="display:none">Keine Artikel gefunden.</div>
+  </div>
+
+  <script>
+    const fallbackUiPath = {json.dumps(ui_path)};
+    const fallbackApiPath = {json.dumps(api_path)};
+    const fallbackCsvPath = {json.dumps(csv_path)};
+
+    function resolveUrl(path) {{
+      try {{ return new URL(path, window.location.origin).toString(); }} catch(_) {{ return path; }}
+    }}
+    function runtimeUiUrl() {{
+      const p = window.location.pathname || '/';
+      return resolveUrl(p.endsWith('/') ? p : p + '/');
+    }}
+
+    let resolvedUiUrl = resolveUrl(fallbackUiPath);
+    let resolvedApiUrl = resolveUrl(fallbackApiPath);
+    let resolvedCsvUrl = resolveUrl(fallbackCsvPath);
+    try {{
+      resolvedUiUrl = runtimeUiUrl();
+      resolvedApiUrl = new URL('api/articles', resolvedUiUrl).toString();
+      resolvedCsvUrl = new URL('api/export/csv', resolvedUiUrl).toString();
+    }} catch(_) {{}}
+
+    document.getElementById('share-link').href = resolvedUiUrl;
+    document.getElementById('share-link').textContent = resolvedUiUrl;
+    document.getElementById('json-link').href = resolvedApiUrl;
+    document.getElementById('csv-link').href = resolvedCsvUrl;
+
+    // ── State ──────────────────────────────────────────────────────────────
+    let allArticles = [];
+    let sortCol = 'rank';
+    let sortAsc = true;
+    let showTop20 = false;
+    let refreshTimer = null;
+    let countdown = 60;
+
+    // ── DOM refs ───────────────────────────────────────────────────────────
+    const tbody = document.getElementById('tbody');
+    const emptyMsg = document.getElementById('empty-msg');
+    const statusBar = document.getElementById('status-bar');
+    const searchEl = document.getElementById('search');
+    const filterRessort = document.getElementById('filter-ressort');
+    const filterHome = document.getElementById('filter-home');
+    const toggle20Btn = document.getElementById('toggle-top20');
+    const refreshBtn = document.getElementById('refresh-btn');
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    function fmtDate(iso) {{
+      if (!iso) return '';
+      try {{
+        const d = new Date(iso);
+        return d.toLocaleString('de-DE', {{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}});
+      }} catch(_) {{ return iso; }}
+    }}
+
+    function scoreClass(s) {{
+      if (s >= 60) return 'score-high';
+      if (s >= 25) return 'score-med';
+      return 'score-low';
+    }}
+
+    function esc(s) {{
+      return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }}
+
+    // ── Filters ────────────────────────────────────────────────────────────
+    function applyFilters(articles) {{
+      const q = searchEl.value.trim().toLowerCase();
+      const res = filterRessort.value;
+      const home = filterHome.value;
+      return articles.filter((a, idx) => {{
+        if (q && !((a.title||'').toLowerCase().includes(q) || (a.canonical_url||'').toLowerCase().includes(q))) return false;
+        if (res && a.ressort !== res) return false;
+        if (home === 'on' && a.home_position == null) return false;
+        if (home === 'off' && a.home_position != null) return false;
+        if (showTop20 && idx >= 20) return false;
+        return true;
+      }});
+    }}
+
+    // ── Sort ───────────────────────────────────────────────────────────────
+    function sortArticles(articles) {{
+      const col = sortCol;
+      const asc = sortAsc;
+      return [...articles].sort((a, b) => {{
+        let va = a[col] ?? (col === 'home_position' ? 1e9 : (typeof a[col] === 'number' ? -1e9 : ''));
+        let vb = b[col] ?? (col === 'home_position' ? 1e9 : (typeof b[col] === 'number' ? -1e9 : ''));
+        if (col === 'rank') {{ va = a._rank ?? 0; vb = b._rank ?? 0; }}
+        if (typeof va === 'string') return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+        return asc ? va - vb : vb - va;
+      }});
+    }}
+
+    // ── Render ─────────────────────────────────────────────────────────────
+    function render() {{
+      const filtered = applyFilters(allArticles);
+      const sorted = sortArticles(filtered);
+      if (!sorted.length) {{
+        tbody.innerHTML = '';
+        emptyMsg.style.display = '';
+        return;
+      }}
+      emptyMsg.style.display = 'none';
+      const html = sorted.map((a, i) => {{
+        const rank = a._rank ?? (i + 1);
+        const isTop5 = rank <= 5;
+        const score = a.urgency_score ?? 0;
+        const url = a.canonical_url || a.source_url || '';
+        const title = a.title || url;
+        const statusCls = a.workflow_status ? '' : ' unknown';
+        const statusLabel = a.workflow_status || 'unbekannt';
+        const homeHtml = a.home_position != null
+          ? `<span class="home-badge">Pos. ${{a.home_position}}</span>`
+          : '<span style="color:#aaa">—</span>';
+        const sources = (a.source_flags || []).join(', ');
+        return `<tr class="${{isTop5 ? 'top5' : ''}}">
+          <td class="rank">${{rank}}</td>
+          <td class="score"><span class="score-badge ${{scoreClass(score)}}">${{score}}</span></td>
+          <td class="title"><a href="${{esc(url)}}" target="_blank" rel="noopener">${{esc(title)}}</a></td>
+          <td class="url"><a href="${{esc(url)}}" target="_blank" rel="noopener">${{esc(url)}}</a></td>
+          <td><span class="status-pill${{statusCls}}">${{esc(statusLabel)}}</span></td>
+          <td class="readers">${{(a.live_readers || 0).toLocaleString('de-DE')}}</td>
+          <td class="homepos">${{homeHtml}}</td>
+          <td class="ressort">${{esc(a.ressort || '')}}</td>
+          <td class="published">${{fmtDate(a.published_at)}}</td>
+          <td class="sources">${{esc(sources)}}</td>
+        </tr>`;
+      }}).join('');
+      tbody.innerHTML = html;
+    }}
+
+    // ── Data load ──────────────────────────────────────────────────────────
+    function updateStatus(msg) {{ statusBar.textContent = msg; }}
+
+    function loadData(force) {{
+      const suffix = force ? '?refresh=1' : '';
+      updateStatus('Lade…');
+      fetch(resolvedApiUrl + suffix)
+        .then(r => {{ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }})
+        .then(data => {{
+          allArticles = data.map((a, i) => ({{ ...a, _rank: i + 1 }}));
+          populateRessortFilter();
+          render();
+          const now = new Date().toLocaleTimeString('de-DE', {{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
+          updateStatus(`${{allArticles.length}} Artikel · Stand: ${{now}}`);
+          resetCountdown();
+        }})
+        .catch(e => {{ updateStatus('Fehler: ' + e.message); }});
+    }}
+
+    function populateRessortFilter() {{
+      const current = filterRessort.value;
+      const ressorts = [...new Set(allArticles.map(a => a.ressort).filter(Boolean))].sort();
+      filterRessort.innerHTML = '<option value="">Alle Ressorts</option>' +
+        ressorts.map(r => `<option value="${{esc(r)}}"${{r === current ? ' selected' : ''}}>${{esc(r)}}</option>`).join('');
+    }}
+
+    // ── Auto-refresh countdown ─────────────────────────────────────────────
+    function resetCountdown() {{
+      countdown = 60;
+      clearInterval(refreshTimer);
+      refreshTimer = setInterval(() => {{
+        countdown -= 1;
+        if (countdown <= 0) {{
+          loadData(false);
+        }} else {{
+          const base = statusBar.textContent.replace(/ · Refresh in \\d+s$/, '');
+          statusBar.textContent = base + ` · Refresh in ${{countdown}}s`;
+        }}
+      }}, 1000);
+    }}
+
+    // ── Sort header clicks ─────────────────────────────────────────────────
+    document.querySelectorAll('thead th[data-col]').forEach(th => {{
+      th.addEventListener('click', () => {{
+        const col = th.dataset.col;
+        if (sortCol === col) {{ sortAsc = !sortAsc; }} else {{ sortCol = col; sortAsc = col !== 'live_readers' && col !== 'urgency_score'; }}
+        document.querySelectorAll('thead th').forEach(t => t.classList.remove('sorted'));
+        th.classList.add('sorted');
+        th.querySelector('.sort-arrow').textContent = sortAsc ? ' ▲' : ' ▼';
+        render();
+      }});
+    }});
+
+    // ── Controls ───────────────────────────────────────────────────────────
+    searchEl.addEventListener('input', render);
+    filterRessort.addEventListener('change', render);
+    filterHome.addEventListener('change', render);
+    toggle20Btn.addEventListener('click', () => {{
+      showTop20 = !showTop20;
+      toggle20Btn.textContent = showTop20 ? 'Alle zeigen' : 'Nur Top 20';
+      render();
+    }});
+    refreshBtn.addEventListener('click', () => loadData(true));
+
+    document.getElementById('copy-share-link').addEventListener('click', async () => {{
+      const copyStatus = document.getElementById('copy-status');
+      try {{
+        if (navigator.clipboard && window.isSecureContext) {{
+          await navigator.clipboard.writeText(resolvedUiUrl);
+        }} else {{
+          const ta = document.createElement('textarea');
+          ta.value = resolvedUiUrl; ta.style.position='absolute'; ta.style.left='-9999px';
+          document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+        }}
+        copyStatus.textContent = 'Link kopiert';
+        setTimeout(() => {{ copyStatus.textContent = ''; }}, 2000);
+      }} catch(_) {{ copyStatus.textContent = 'Kopieren fehlgeschlagen'; }}
+    }});
+
+    // ── Init ───────────────────────────────────────────────────────────────
+    loadData(false);
+  </script>
+</body>
+</html>""".strip()
+
+
+ADOBE_SOURCE = _env_source("TC_ADOBE_SOURCE", ADOBE)
+RSS_SOURCE = _env_source("TC_RSS_SOURCE", RSS)
+HOME_SOURCE = _env_source("TC_HOME_SOURCE", HOME)
+API_CHECK = _env_bool("TC_API_CHECK", default=False)
+CACHE_SECONDS = _env_int("TC_CACHE_SECONDS", default=30, minimum=0)
+BASE_PATH = _normalize_base_path(os.environ.get("TC_BASE_PATH", "/"))
+PUBLIC_BASE_URL = _normalize_public_base_url(os.environ.get("TC_PUBLIC_BASE_URL"))
+EDITORIAL_ONE_ENABLED = _env_bool("TC_EDITORIAL_ONE_ENABLED", default=False)
+EDITORIAL_ONE_STRICT = _env_bool("TC_EDITORIAL_ONE_STRICT", default=False)
+EDITORIAL_ONE_HOURS = _env_int("TC_EDITORIAL_ONE_HOURS", default=24, minimum=1)
+EDITORIAL_ONE_LIMIT = _env_int("TC_EDITORIAL_ONE_LIMIT", default=300, minimum=1)
+EDITORIAL_ONE_PYC = os.environ.get(
+    "TC_EDITORIAL_ONE_PYC",
+    "/Users/riccardo.longo/editorial-intel/__pycache__/bild_published.cpython-313.pyc",
+).strip()
+_CACHE_LOCK = threading.Lock()
+_CACHE_DATA: list[dict[str, object]] | None = None
+_CACHE_EXPIRES_AT = 0.0
+_EDITORIAL_ONE_MODULE = None
+_EDITORIAL_ONE_MODULE_LOCK = threading.Lock()
+
+
+def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
+    global _CACHE_DATA, _CACHE_EXPIRES_AT
+
+    now = time.monotonic()
+    if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
+        return _CACHE_DATA
+
+    with _CACHE_LOCK:
+        now = time.monotonic()
+        if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
+            return _CACHE_DATA
+
+        if EDITORIAL_ONE_ENABLED:
+            try:
+                editorial_one_data = _load_editorial_one_articles(force_refresh=force_refresh)
+                if editorial_one_data:
+                    data = editorial_one_data
+                elif EDITORIAL_ONE_STRICT:
+                    raise RuntimeError("Editorial-One lieferte keine Artikel")
+                else:
+                    data = run_mvp(
+                        adobe_file=ADOBE_SOURCE,
+                        rss_file=RSS_SOURCE,
+                        home_file=HOME_SOURCE,
+                        api_check=API_CHECK,
+                    )
+            except Exception:
+                if EDITORIAL_ONE_STRICT:
+                    raise
+                data = run_mvp(
+                    adobe_file=ADOBE_SOURCE,
+                    rss_file=RSS_SOURCE,
+                    home_file=HOME_SOURCE,
+                    api_check=API_CHECK,
+                )
+        else:
+            data = run_mvp(
+                adobe_file=ADOBE_SOURCE,
+                rss_file=RSS_SOURCE,
+                home_file=HOME_SOURCE,
+                api_check=API_CHECK,
+            )
+        if CACHE_SECONDS > 0:
+            _CACHE_DATA = data
+            _CACHE_EXPIRES_AT = time.monotonic() + CACHE_SECONDS
+        else:
+            _CACHE_DATA = data
+            _CACHE_EXPIRES_AT = 0.0
+        return data
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, data: object, status: int = 200) -> None:
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_html(self, html: str, status: int = 200) -> None:
+        payload = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = _normalize_request_path(parsed.path)
+        query = parse_qs(parsed.query)
+        route_path = _path_from_request(path)
+
+        if route_path == "/healthz":
+            self._send_json(
+                {
+                    "status": "ok",
+                    "cache_seconds": CACHE_SECONDS,
+                    "api_check": API_CHECK,
+                    "base_path": BASE_PATH,
+                    "public_base_url": PUBLIC_BASE_URL,
+                    "share_url": _public_url("/"),
+                    "editorial_one_enabled": EDITORIAL_ONE_ENABLED,
+                    "editorial_one_strict": EDITORIAL_ONE_STRICT,
+                    "editorial_one_hours": EDITORIAL_ONE_HOURS if EDITORIAL_ONE_ENABLED else None,
+                    "editorial_one_limit": EDITORIAL_ONE_LIMIT if EDITORIAL_ONE_ENABLED else None,
+                }
+            )
+            return
+
+        if route_path == "/api/articles":
+            refresh = query.get("refresh", [""])[0].strip().lower() in {"1", "true", "yes"}
+            try:
+                data = load_articles(force_refresh=refresh)
+            except Exception as exc:
+                self._send_json({"error": "data_load_failed", "message": str(exc)}, status=502)
+                return
+            self._send_json(data)
+            return
+
+        if route_path == "/api/export/csv":
+            try:
+                data = load_articles(force_refresh=False)
+            except Exception as exc:
+                self._send_json({"error": "data_load_failed", "message": str(exc)}, status=502)
+                return
+            buf = io.StringIO()
+            fieldnames = [
+                "rank", "urgency_score", "title", "canonical_url", "workflow_status",
+                "live_readers", "home_position", "ressort", "published_at", "source_flags", "cms_id",
+            ]
+            writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\n")
+            writer.writeheader()
+            for idx, row in enumerate(data, start=1):
+                row_out = dict(row)
+                row_out["rank"] = idx
+                row_out["source_flags"] = ", ".join(row_out.get("source_flags") or [])
+                writer.writerow({k: row_out.get(k, "") for k in fieldnames})
+            payload = buf.getvalue().encode("utf-8-sig")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="tc_artikelliste.csv"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if route_path == "/":
+            link_base_path = _base_path_for_links(path)
+            self._send_html(
+                build_index_html(
+                    ui_path=_with_base_path("/", base_path=link_base_path),
+                    api_path=_with_base_path("/api/articles", base_path=link_base_path),
+                    health_path=_with_base_path("/healthz", base_path=link_base_path),
+                    csv_path=_with_base_path("/api/export/csv", base_path=link_base_path),
+                )
+            )
+            return
+
+        self._send_json({"error": "not_found"}, status=404)
+
+
+if __name__ == "__main__":
+    host = os.environ.get("TC_HOST", "0.0.0.0")
+    port, port_source = _resolve_listen_port()
+
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
+    except OSError as exc:
+        print(f"Server-Start fehlgeschlagen auf {host}:{port}: {exc}")
+        print("Setze bei Bedarf einen freien Port, z. B.: TC_PORT=8100 python3 src/server.py")
+        print("Wenn nur lokale Tests gewünscht sind: TC_HOST=127.0.0.1 TC_PORT=8100 python3 src/server.py")
+        print("Serverloser Fallback (ohne localhost-Port): python3 src/static_preview.py")
+        raise SystemExit(1)
+
+    actual_port = server.server_address[1]
+    print(f"Server gebunden auf {host}:{actual_port}")
+    print(f"Port-Quelle: {port_source}")
+    print(f"Datenquellen: adobe={ADOBE_SOURCE} rss={RSS_SOURCE} home={HOME_SOURCE}")
+    print(f"API-Check: {'aktiv' if API_CHECK else 'aus'} | Cache: {CACHE_SECONDS}s | Base-Path: {BASE_PATH}")
+    if EDITORIAL_ONE_ENABLED:
+        print(
+            "Editorial-One Modus: aktiv"
+            f" | pyc={EDITORIAL_ONE_PYC}"
+            f" | hours={EDITORIAL_ONE_HOURS}"
+            f" | limit={EDITORIAL_ONE_LIMIT}"
+            f" | strict={'ja' if EDITORIAL_ONE_STRICT else 'nein'}"
+        )
+    else:
+        print("Editorial-One Modus: aus (nutze TC_ADOBE_SOURCE/TC_RSS_SOURCE/TC_HOME_SOURCE)")
+    if PUBLIC_BASE_URL:
+        print(f"Share-Link: {_public_url('/')}")
+        print(f"Share-API: {_public_url('/api/articles')}")
+        print(f"Share-Health: {_public_url('/healthz')}")
+    else:
+        print(f"Hinweis: Für klaren Hosting-Link TC_PUBLIC_BASE_URL setzen, z. B. https://dein-host{_with_base_path('/')}")
+    if host == "0.0.0.0":
+        print(f"UI lokal: http://localhost:{actual_port}{_with_base_path('/')}")
+        print(f"API lokal: http://localhost:{actual_port}{_with_base_path('/api/articles')}")
+        print(f"Health lokal: http://localhost:{actual_port}{_with_base_path('/healthz')}")
+        print(f"Alternative lokal: http://127.0.0.1:{actual_port}{_with_base_path('/')}")
+    else:
+        print(f"UI lokal: http://{host}:{actual_port}{_with_base_path('/')}")
+        print(f"API lokal: http://{host}:{actual_port}{_with_base_path('/api/articles')}")
+        print(f"Health lokal: http://{host}:{actual_port}{_with_base_path('/healthz')}")
+    server.serve_forever()

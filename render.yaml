@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: tc-artikelliste
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TC_PUBLIC_BASE_URL
+        value: https://tc-artikelliste.onrender.com
+      - key: TC_CACHE_SECONDS
+        value: "30"
+      - key: TC_ADOBE_SOURCE
+        value: fixtures/adobe_sample.json
+      - key: TC_RSS_SOURCE
+        value: fixtures/rss_sample.xml
+      - key: TC_HOME_SOURCE
+        value: fixtures/home_positions_sample.json
+    healthCheckPath: /healthz
