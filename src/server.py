@@ -268,10 +268,17 @@ def _load_editorial_one_articles(force_refresh: bool = False) -> list[dict[str, 
     return mapped_rows
 
 
-def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path: str = "") -> str:
+def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path: str = "", fixture_mode: bool = False) -> str:
+    fixture_banner = (
+        '<div style="background:#fff3cd;border-bottom:2px solid #e6a817;padding:8px 16px;font-size:12px;color:#7f4f00;">'
+        '<strong>Beispieldaten aktiv</strong> – echte Quellen nicht konfiguriert '
+        '(TC_ADOBE_SOURCE / TC_RSS_SOURCE nicht gesetzt). Diese Ansicht zeigt Testdaten, keine Live-Artikel.'
+        '</div>'
+        if fixture_mode else ""
+    )
     return f"""<!doctype html>
 <html lang="de">
-<head>
+<head>  <!-- fixture_mode={fixture_mode} health={health_path} -->
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Textchefs Artikelliste</title>
@@ -324,6 +331,7 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
   </style>
 </head>
 <body>
+  {fixture_banner}
   <header>
     <h1>Textchefs Artikelliste</h1>
     <div class="share-row">
@@ -587,12 +595,16 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
 ADOBE_SOURCE = _env_source("TC_ADOBE_SOURCE", ADOBE)
 RSS_SOURCE = _env_source("TC_RSS_SOURCE", RSS)
 HOME_SOURCE = _env_source("TC_HOME_SOURCE", HOME)
+
+def _is_fixture(source: Path | str) -> bool:
+    return not str(source).strip().lower().startswith(("http://", "https://"))
 API_CHECK = _env_bool("TC_API_CHECK", default=False)
 CACHE_SECONDS = _env_int("TC_CACHE_SECONDS", default=30, minimum=0)
 BASE_PATH = _normalize_base_path(os.environ.get("TC_BASE_PATH", "/"))
 PUBLIC_BASE_URL = _normalize_public_base_url(os.environ.get("TC_PUBLIC_BASE_URL"))
 EDITORIAL_ONE_ENABLED = _env_bool("TC_EDITORIAL_ONE_ENABLED", default=False)
 EDITORIAL_ONE_STRICT = _env_bool("TC_EDITORIAL_ONE_STRICT", default=False)
+IS_FIXTURE_MODE = not EDITORIAL_ONE_ENABLED and _is_fixture(ADOBE_SOURCE) and _is_fixture(RSS_SOURCE)
 EDITORIAL_ONE_HOURS = _env_int("TC_EDITORIAL_ONE_HOURS", default=24, minimum=1)
 EDITORIAL_ONE_LIMIT = _env_int("TC_EDITORIAL_ONE_LIMIT", default=300, minimum=1)
 EDITORIAL_ONE_PYC = os.environ.get(
@@ -689,6 +701,7 @@ class Handler(BaseHTTPRequestHandler):
                     "base_path": BASE_PATH,
                     "public_base_url": PUBLIC_BASE_URL,
                     "share_url": _public_url("/"),
+                    "fixture_mode": IS_FIXTURE_MODE,
                     "editorial_one_enabled": EDITORIAL_ONE_ENABLED,
                     "editorial_one_strict": EDITORIAL_ONE_STRICT,
                     "editorial_one_hours": EDITORIAL_ONE_HOURS if EDITORIAL_ONE_ENABLED else None,
@@ -742,6 +755,7 @@ class Handler(BaseHTTPRequestHandler):
                     api_path=_with_base_path("/api/articles", base_path=link_base_path),
                     health_path=_with_base_path("/healthz", base_path=link_base_path),
                     csv_path=_with_base_path("/api/export/csv", base_path=link_base_path),
+                    fixture_mode=IS_FIXTURE_MODE,
                 )
             )
             return
