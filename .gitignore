@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.tc_live_sources.env
+data/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+!.tc_live_sources.env.example
