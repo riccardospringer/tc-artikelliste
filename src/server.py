@@ -720,6 +720,27 @@ _CACHE_DATA: list[dict[str, object]] | None = None
 _CACHE_EXPIRES_AT = 0.0
 _EDITORIAL_ONE_MODULE = None
 _EDITORIAL_ONE_MODULE_LOCK = threading.Lock()
+_ADOBE_ENRICHMENT_RUNNING = threading.Event()
+
+
+def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
+    """Holt Live-Leser im Hintergrund und aktualisiert den Cache direkt."""
+    if not _ADOBE_AVAILABLE:
+        return
+    try:
+        urls = [a.get("canonical_url", "") for a in data if a.get("canonical_url")]
+        reader_map = _adobe.fetch_live_readers(urls)
+        if reader_map:
+            with _CACHE_LOCK:
+                if _CACHE_DATA is not None:
+                    for a in _CACHE_DATA:
+                        url = a.get("canonical_url", "")
+                        if url in reader_map:
+                            a["live_readers"] = reader_map[url]
+    except Exception:
+        pass
+    finally:
+        _ADOBE_ENRICHMENT_RUNNING.clear()
 
 
 def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
@@ -780,18 +801,12 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
                 home_file=_home_src,
                 api_check=API_CHECK,
             )
-        # Adobe Live-Reader-Enrichment: live_readers überschreiben wenn Adobe konfiguriert
+        # Adobe Live-Reader-Enrichment: im Hintergrund, damit Render-Proxy-Timeout (5s) nicht greift
         if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
-            try:
-                urls = [a.get("canonical_url", "") for a in data if a.get("canonical_url")]
-                reader_map = _adobe.fetch_live_readers(urls)
-                if reader_map:
-                    for a in data:
-                        url = a.get("canonical_url", "")
-                        if url in reader_map:
-                            a["live_readers"] = reader_map[url]
-            except Exception:
-                pass  # Adobe-Fehler → bestehende live_readers beibehalten
+            if not _ADOBE_ENRICHMENT_RUNNING.is_set():
+                _ADOBE_ENRICHMENT_RUNNING.set()
+                t = threading.Thread(target=_run_adobe_enrichment_async, args=(data,), daemon=True)
+                t.start()
 
         if CACHE_SECONDS > 0:
             _CACHE_DATA = data
@@ -989,4 +1004,7 @@ if __name__ == "__main__":
         print(f"UI lokal: http://{host}:{actual_port}{_with_base_path('/')}")
         print(f"API lokal: http://{host}:{actual_port}{_with_base_path('/api/articles')}")
         print(f"Health lokal: http://{host}:{actual_port}{_with_base_path('/healthz')}")
+    # Artikel im Hintergrund vorladen damit der Cache beim ersten Request warm ist
+    if not NO_SOURCES_STATE:
+        threading.Thread(target=load_articles, kwargs={"force_refresh": True}, daemon=True).start()
     server.serve_forever()
