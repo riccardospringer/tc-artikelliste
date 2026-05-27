@@ -8,10 +8,6 @@ services:
         value: https://tc-artikelliste.onrender.com
       - key: TC_CACHE_SECONDS
         value: "30"
-      - key: TC_ADOBE_SOURCE
-        value: fixtures/adobe_sample.json
       - key: TC_RSS_SOURCE
-        value: fixtures/rss_sample.xml
-      - key: TC_HOME_SOURCE
-        value: fixtures/home_positions_sample.json
+        value: http://www.bild.de/rss-feeds/rss-16725492,feed=alles.bild.html
     healthCheckPath: /healthz

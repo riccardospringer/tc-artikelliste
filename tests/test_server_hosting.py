@@ -14,6 +14,7 @@ def test_load_articles_uses_cache(monkeypatch) -> None:
     monkeypatch.setattr(server, "CACHE_SECONDS", 60)
     monkeypatch.setattr(server, "_CACHE_DATA", None)
     monkeypatch.setattr(server, "_CACHE_EXPIRES_AT", 0.0)
+    monkeypatch.setattr(server, "FIXTURE_MODE_EXPLICIT", True)  # allow mock data in test
 
     first = server.load_articles(force_refresh=False)
     second = server.load_articles(force_refresh=False)
@@ -34,6 +35,7 @@ def test_load_articles_force_refresh_bypasses_cache(monkeypatch) -> None:
     monkeypatch.setattr(server, "CACHE_SECONDS", 60)
     monkeypatch.setattr(server, "_CACHE_DATA", None)
     monkeypatch.setattr(server, "_CACHE_EXPIRES_AT", 0.0)
+    monkeypatch.setattr(server, "FIXTURE_MODE_EXPLICIT", True)  # allow mock data in test
 
     first = server.load_articles(force_refresh=False)
     second = server.load_articles(force_refresh=True)

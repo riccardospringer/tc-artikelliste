@@ -268,14 +268,24 @@ def _load_editorial_one_articles(force_refresh: bool = False) -> list[dict[str, 
     return mapped_rows
 
 
-def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path: str = "", fixture_mode: bool = False) -> str:
-    fixture_banner = (
-        '<div style="background:#fff3cd;border-bottom:2px solid #e6a817;padding:8px 16px;font-size:12px;color:#7f4f00;">'
-        '<strong>Beispieldaten aktiv</strong> – echte Quellen nicht konfiguriert '
-        '(TC_ADOBE_SOURCE / TC_RSS_SOURCE nicht gesetzt). Diese Ansicht zeigt Testdaten, keine Live-Artikel.'
-        '</div>'
-        if fixture_mode else ""
-    )
+def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path: str = "", fixture_mode: bool = False, no_sources_state: bool = False) -> str:
+    if no_sources_state:
+        top_banner = (
+            '<div style="background:#fdecea;border-bottom:3px solid #c62828;padding:12px 16px;font-size:13px;color:#c62828;">'
+            '<strong>Keine Live-Daten verfügbar</strong> – echte Quellen nicht konfiguriert. '
+            'Bitte <code>TC_RSS_SOURCE</code> und/oder <code>TC_ADOBE_SOURCE</code> als HTTP-URL setzen. '
+            'Für lokales Testen: <code>TC_FIXTURE_MODE=true</code>'
+            '</div>'
+        )
+    elif fixture_mode:
+        top_banner = (
+            '<div style="background:#b71c1c;border-bottom:3px solid #7f0000;padding:8px 16px;font-size:12px;color:#fff;">'
+            '<strong>DEMO-MODUS</strong> – Beispieldaten aktiv, keine echten Live-Artikel. '
+            'Nur für lokale Entwicklung (TC_FIXTURE_MODE=true).'
+            '</div>'
+        )
+    else:
+        top_banner = ""
     return f"""<!doctype html>
 <html lang="de">
 <head>  <!-- fixture_mode={fixture_mode} health={health_path} -->
@@ -331,7 +341,7 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
   </style>
 </head>
 <body>
-  {fixture_banner}
+  {top_banner}
   <header>
     <h1>Textchefs Artikelliste</h1>
     <div class="share-row">
@@ -341,6 +351,17 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
       &nbsp;·&nbsp;<a id="health-link" href="{health_path}" style="font-size:10px;color:#eee;">health</a>
     </div>
   </header>
+  <div id="no-sources-state" style="display:{'none' if not no_sources_state else 'block'};max-width:700px;margin:60px auto;padding:32px;background:#fff;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.12);text-align:center;">
+    <div style="font-size:48px;margin-bottom:16px;">⚙️</div>
+    <h2 style="font-size:20px;margin-bottom:12px;color:#c62828;">Keine echten Datenquellen konfiguriert</h2>
+    <p style="color:#555;margin-bottom:20px;">Die App läuft, aber es sind keine echten Live-Quellen eingerichtet.<br>Bitte folgende Umgebungsvariablen setzen:</p>
+    <pre style="background:#f5f5f5;padding:14px;border-radius:4px;text-align:left;font-size:12px;color:#1a1a1a;">TC_RSS_SOURCE=https://www.bild.de/rss-feeds/...
+TC_ADOBE_SOURCE=https://intern.example.com/adobe/live.json
+TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
+    <p style="color:#888;font-size:12px;margin-top:16px;">Für lokales Testen mit Beispieldaten: <code>TC_FIXTURE_MODE=true</code></p>
+    <p style="color:#888;font-size:12px;"><a href="{health_path}" style="color:#d0021b;">Healthcheck</a></p>
+  </div>
+  <div id="app-content" style="display:{'none' if no_sources_state else 'block'}">
   <div class="toolbar">
     <input type="search" id="search" placeholder="Suche nach Titel oder URL…" autocomplete="off">
     <select id="filter-ressort"><option value="">Alle Ressorts</option></select>
@@ -375,8 +396,12 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
     </table>
     <div class="empty" id="empty-msg" style="display:none">Keine Artikel gefunden.</div>
   </div>
+  </div><!-- end app-content -->
 
   <script>
+    const NO_SOURCES = {json.dumps(no_sources_state)};
+    const FIXTURE_ACTIVE = {json.dumps(fixture_mode)};
+
     const fallbackUiPath = {json.dumps(ui_path)};
     const fallbackApiPath = {json.dumps(api_path)};
     const fallbackCsvPath = {json.dumps(csv_path)};
@@ -586,7 +611,14 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
     }});
 
     // ── Init ───────────────────────────────────────────────────────────────
-    loadData(false);
+    if (NO_SOURCES) {{
+      updateStatus('Keine echten Datenquellen konfiguriert.');
+      document.getElementById('csv-link').style.display = 'none';
+      document.getElementById('json-link').style.display = 'none';
+      document.getElementById('refresh-btn').style.display = 'none';
+    }} else {{
+      loadData(false);
+    }}
   </script>
 </body>
 </html>""".strip()
@@ -598,13 +630,23 @@ HOME_SOURCE = _env_source("TC_HOME_SOURCE", HOME)
 
 def _is_fixture(source: Path | str) -> bool:
     return not str(source).strip().lower().startswith(("http://", "https://"))
+
 API_CHECK = _env_bool("TC_API_CHECK", default=False)
 CACHE_SECONDS = _env_int("TC_CACHE_SECONDS", default=30, minimum=0)
 BASE_PATH = _normalize_base_path(os.environ.get("TC_BASE_PATH", "/"))
 PUBLIC_BASE_URL = _normalize_public_base_url(os.environ.get("TC_PUBLIC_BASE_URL"))
 EDITORIAL_ONE_ENABLED = _env_bool("TC_EDITORIAL_ONE_ENABLED", default=False)
 EDITORIAL_ONE_STRICT = _env_bool("TC_EDITORIAL_ONE_STRICT", default=False)
-IS_FIXTURE_MODE = not EDITORIAL_ONE_ENABLED and _is_fixture(ADOBE_SOURCE) and _is_fixture(RSS_SOURCE)
+
+# TC_FIXTURE_MODE=true erlaubt Fixture-Daten nur in explizitem Development-Modus.
+FIXTURE_MODE_EXPLICIT = _env_bool("TC_FIXTURE_MODE", default=False)
+USING_REAL_DATA = EDITORIAL_ONE_ENABLED or not _is_fixture(ADOBE_SOURCE) or not _is_fixture(RSS_SOURCE)
+# Fixture-Modus nur aktiv wenn explizit aktiviert UND keine echten Quellen vorhanden.
+FIXTURE_MODE_ACTIVE = FIXTURE_MODE_EXPLICIT and not USING_REAL_DATA
+# Setup-State: keine echten Quellen, kein Fixture-Flag → leere Artikelliste, kein Export.
+NO_SOURCES_STATE = not USING_REAL_DATA and not FIXTURE_MODE_EXPLICIT
+# Rückwärtskompatibel für Tests
+IS_FIXTURE_MODE = FIXTURE_MODE_ACTIVE
 EDITORIAL_ONE_HOURS = _env_int("TC_EDITORIAL_ONE_HOURS", default=24, minimum=1)
 EDITORIAL_ONE_LIMIT = _env_int("TC_EDITORIAL_ONE_LIMIT", default=300, minimum=1)
 EDITORIAL_ONE_PYC = os.environ.get(
@@ -629,6 +671,16 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
         now = time.monotonic()
         if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
             return _CACHE_DATA
+
+        # Dynamisch auswerten damit monkeypatching in Tests funktioniert.
+        _no_sources_now = (
+            not EDITORIAL_ONE_ENABLED
+            and _is_fixture(ADOBE_SOURCE)
+            and _is_fixture(RSS_SOURCE)
+            and not FIXTURE_MODE_EXPLICIT
+        )
+        if _no_sources_now:
+            return []
 
         if EDITORIAL_ONE_ENABLED:
             try:
@@ -701,7 +753,12 @@ class Handler(BaseHTTPRequestHandler):
                     "base_path": BASE_PATH,
                     "public_base_url": PUBLIC_BASE_URL,
                     "share_url": _public_url("/"),
-                    "fixture_mode": IS_FIXTURE_MODE,
+                    "using_real_data": USING_REAL_DATA,
+                    "adobe_source_configured": not _is_fixture(ADOBE_SOURCE),
+                    "rss_source_configured": not _is_fixture(RSS_SOURCE),
+                    "fixture_mode_active": FIXTURE_MODE_ACTIVE,
+                    "fixture_mode_explicit": FIXTURE_MODE_EXPLICIT,
+                    "no_sources_state": NO_SOURCES_STATE,
                     "editorial_one_enabled": EDITORIAL_ONE_ENABLED,
                     "editorial_one_strict": EDITORIAL_ONE_STRICT,
                     "editorial_one_hours": EDITORIAL_ONE_HOURS if EDITORIAL_ONE_ENABLED else None,
@@ -721,6 +778,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route_path == "/api/export/csv":
+            if NO_SOURCES_STATE:
+                self._send_json({"error": "no_real_sources", "message": "Keine echten Datenquellen konfiguriert. Bitte TC_RSS_SOURCE oder TC_ADOBE_SOURCE als HTTP-URL setzen."}, status=503)
+                return
             try:
                 data = load_articles(force_refresh=False)
             except Exception as exc:
@@ -755,7 +815,8 @@ class Handler(BaseHTTPRequestHandler):
                     api_path=_with_base_path("/api/articles", base_path=link_base_path),
                     health_path=_with_base_path("/healthz", base_path=link_base_path),
                     csv_path=_with_base_path("/api/export/csv", base_path=link_base_path),
-                    fixture_mode=IS_FIXTURE_MODE,
+                    fixture_mode=FIXTURE_MODE_ACTIVE,
+                    no_sources_state=NO_SOURCES_STATE,
                 )
             )
             return
