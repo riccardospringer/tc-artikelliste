@@ -315,6 +315,10 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
     .btn-primary {{ background: #d0021b; color: #fff; border-color: #b50218; }}
     .btn-primary:hover {{ background: #b50218; }}
     .status-bar {{ font-size: 11px; color: #666; margin-left: auto; white-space: nowrap; }}
+    .tab-bar {{ background: #fff; border-bottom: 1px solid #ddd; padding: 0 16px; display: flex; gap: 4px; }}
+    .tab-btn {{ height: 36px; padding: 0 16px; border: none; border-bottom: 3px solid transparent; background: none; font-size: 13px; font-weight: 500; cursor: pointer; color: #666; white-space: nowrap; }}
+    .tab-btn:hover {{ color: #1a1a1a; }}
+    .tab-btn.active {{ color: #d0021b; border-bottom-color: #d0021b; font-weight: 700; }}
     .table-wrap {{ overflow-x: auto; padding: 0 16px 16px; }}
     table {{ width: 100%; border-collapse: collapse; background: #fff; margin-top: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
     thead th {{ background: #1a1a1a; color: #fff; padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 600; white-space: nowrap; cursor: pointer; user-select: none; position: sticky; top: 0; z-index: 1; }}
@@ -373,6 +377,10 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
     <p style="color:#888;font-size:12px;"><a href="{health_path}" style="color:#d0021b;">Healthcheck</a></p>
   </div>
   <div id="app-content" style="display:{'none' if no_sources_state else 'block'}">
+  <div class="tab-bar">
+    <button class="tab-btn active" id="tab-main" type="button">Aktuelle Artikel</button>
+    <button class="tab-btn" id="tab-excluded" type="button">Redigiert / Zum Verbauen</button>
+  </div>
   <div class="toolbar">
     <input type="search" id="search" placeholder="Suche nach Titel oder URL…" autocomplete="off">
     <select id="filter-ressort"><option value="">Alle Ressorts</option></select>
@@ -441,6 +449,7 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
 
     // ── State ──────────────────────────────────────────────────────────────
     let allArticles = [];
+    let activeTab = 'main';
     let sortCol = 'rank';
     let sortAsc = true;
     let showTop20 = false;
@@ -596,9 +605,9 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
     function updateStatus(msg) {{ statusBar.textContent = msg; }}
 
     function loadData(force) {{
-      const suffix = force ? '?refresh=1' : '';
+      const tabParam = activeTab === 'excluded' ? '?tab=excluded' : (force ? '?refresh=1' : '');
       updateStatus('Lade…');
-      fetch(resolvedApiUrl + suffix)
+      fetch(resolvedApiUrl + tabParam)
         .then(r => {{ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }})
         .then(data => {{
           allArticles = data.map((a, i) => ({{ ...a, _rank: i + 1 }}));
@@ -671,6 +680,22 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
       }} catch(_) {{ copyStatus.textContent = 'Kopieren fehlgeschlagen'; }}
     }});
 
+    // ── Tab-Switch ─────────────────────────────────────────────────────────
+    document.getElementById('tab-main').addEventListener('click', () => {{
+      activeTab = 'main';
+      document.getElementById('tab-main').classList.add('active');
+      document.getElementById('tab-excluded').classList.remove('active');
+      sortCol = 'rank'; sortAsc = true;
+      loadData(false);
+    }});
+    document.getElementById('tab-excluded').addEventListener('click', () => {{
+      activeTab = 'excluded';
+      document.getElementById('tab-excluded').classList.add('active');
+      document.getElementById('tab-main').classList.remove('active');
+      sortCol = 'rank'; sortAsc = true;
+      loadData(false);
+    }});
+
     // ── Init ───────────────────────────────────────────────────────────────
     if (NO_SOURCES) {{
       updateStatus('Keine echten Datenquellen konfiguriert.');
@@ -717,6 +742,7 @@ EDITORIAL_ONE_PYC = os.environ.get(
 ).strip()
 _CACHE_LOCK = threading.Lock()
 _CACHE_DATA: list[dict[str, object]] | None = None
+_CACHE_EXCLUDED: list[dict[str, object]] = []
 _CACHE_EXPIRES_AT = 0.0
 _LOAD_IN_PROGRESS = threading.Lock()  # verhindert parallele Lade-Vorgänge
 _EDITORIAL_ONE_MODULE = None
@@ -797,28 +823,40 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
         _ADOBE_ENRICHMENT_RUNNING.clear()
 
 
-def _do_fetch_articles(force_refresh: bool, adobe_src, rss_src, home_src) -> list[dict[str, object]]:
-    """Führt den eigentlichen Datenabruf durch — OHNE Lock, kann lange dauern."""
+def _do_fetch_articles(
+    force_refresh: bool, adobe_src, rss_src, home_src
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Führt den eigentlichen Datenabruf durch — OHNE Lock, kann lange dauern.
+    Gibt (main_articles, excluded_articles) zurück."""
     if EDITORIAL_ONE_ENABLED:
         try:
             editorial_one_data = _load_editorial_one_articles(force_refresh=force_refresh)
             if editorial_one_data:
-                return editorial_one_data
+                return editorial_one_data, []
             if EDITORIAL_ONE_STRICT:
                 raise RuntimeError("Editorial-One lieferte keine Artikel")
         except Exception:
             if EDITORIAL_ONE_STRICT:
                 raise
-    return run_mvp(
+    result = run_mvp(
         adobe_file=adobe_src,
         rss_file=rss_src,
         home_file=home_src,
         api_check=API_CHECK,
+        return_excluded=True,
     )
+    if isinstance(result, tuple):
+        return result
+    return result, []
+
+
+def load_excluded_articles() -> list[dict[str, object]]:
+    """Gibt die aktuellen ausgeschlossenen Artikel (redigiert/zum verbauen) zurück."""
+    return _CACHE_EXCLUDED
 
 
 def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
-    global _CACHE_DATA, _CACHE_EXPIRES_AT
+    global _CACHE_DATA, _CACHE_EXCLUDED, _CACHE_EXPIRES_AT
 
     now = time.monotonic()
     if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
@@ -850,10 +888,9 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
         _home_src = HOME_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(HOME_SOURCE)) else None
 
         # RSS-Fetch läuft ohne Cache-Lock — dauert >5s, darf andere Requests nicht blockieren
-        data = _do_fetch_articles(force_refresh, _adobe_src, _rss_src, _home_src)
+        data, excluded = _do_fetch_articles(force_refresh, _adobe_src, _rss_src, _home_src)
 
         # Alte live_readers-Werte aus dem Cache in neue Artikel übernehmen
-        # (verhindert Flash of 0 zwischen RSS-Refresh und Adobe-Enrichment)
         with _CACHE_LOCK:
             old_cache = _CACHE_DATA
         if old_cache and data:
@@ -880,13 +917,15 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
                 t = threading.Thread(target=_run_adobe_enrichment_async, args=(data,), daemon=True)
                 t.start()
 
-        # Ergebnis kurz im Cache schreiben (sehr schnell)
+        # Ergebnis in Cache schreiben
         with _CACHE_LOCK:
             if CACHE_SECONDS > 0:
                 _CACHE_DATA = data
+                _CACHE_EXCLUDED = excluded
                 _CACHE_EXPIRES_AT = time.monotonic() + CACHE_SECONDS
             else:
                 _CACHE_DATA = data
+                _CACHE_EXCLUDED = excluded
                 _CACHE_EXPIRES_AT = 0.0
         return data
     finally:
@@ -948,12 +987,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if route_path == "/api/articles":
             refresh = query.get("refresh", [""])[0].strip().lower() in {"1", "true", "yes"}
+            tab = query.get("tab", ["main"])[0].strip().lower()
             try:
-                data = load_articles(force_refresh=refresh)
+                if tab == "excluded":
+                    self._send_json(load_excluded_articles())
+                else:
+                    data = load_articles(force_refresh=refresh)
+                    self._send_json(data)
             except Exception as exc:
                 self._send_json({"error": "data_load_failed", "message": str(exc)}, status=502)
                 return
-            self._send_json(data)
             return
 
         if route_path == "/api/admin/adobe/test":
@@ -1089,10 +1132,11 @@ if __name__ == "__main__":
                 _adobe_src = ADOBE_SOURCE if not _is_fixture(ADOBE_SOURCE) else None
                 _rss_src = RSS_SOURCE if not _is_fixture(RSS_SOURCE) else None
                 _home_src = HOME_SOURCE if not _is_fixture(HOME_SOURCE) else None
-                data = _do_fetch_articles(True, _adobe_src, _rss_src, _home_src)
+                data, excluded = _do_fetch_articles(True, _adobe_src, _rss_src, _home_src)
                 with _CACHE_LOCK:
-                    global _CACHE_DATA, _CACHE_EXPIRES_AT
+                    global _CACHE_DATA, _CACHE_EXCLUDED, _CACHE_EXPIRES_AT
                     _CACHE_DATA = data
+                    _CACHE_EXCLUDED = excluded
                     _CACHE_EXPIRES_AT = time.monotonic() + (CACHE_SECONDS if CACHE_SECONDS > 0 else 0.0)
                 if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
                     if not _ADOBE_ENRICHMENT_RUNNING.is_set():

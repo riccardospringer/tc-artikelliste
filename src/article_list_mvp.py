@@ -606,7 +606,8 @@ def run_mvp(
     out_file: Path | None = None,
     connector_config: ConnectorConfig | None = None,
     api_check: bool = False,
-) -> list[dict[str, Any]]:
+    return_excluded: bool = False,
+) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     cfg = connector_config or ConnectorConfig()
     if api_check and adobe_file and rss_file:
         check_live_connector_apis(adobe_file, rss_file, config=cfg)
@@ -615,11 +616,33 @@ def run_mvp(
     rss = load_rss(rss_file, config=cfg) if rss_file else []
     home = load_home_positions(home_file, config=cfg) if home_file else []
 
+    merged = _merge_ingest_rows(
+        _normalize_adobe_rows(adobe) + _normalize_rss_rows(rss) + _normalize_home_rows(home)
+    )
+
+    main_recs = [
+        rec for rec in merged
+        if rec.workflow_statuses.isdisjoint(EXCLUDED_WORKFLOW_STATUSES)
+        and ("rss" in rec.source_flags or "adobe" in rec.source_flags)
+    ]
+    excluded_recs = [
+        rec for rec in merged
+        if not rec.workflow_statuses.isdisjoint(EXCLUDED_WORKFLOW_STATUSES)
+    ]
+
+    # Score + Sort für Hauptliste
     ranked = build_prioritized_article_list(adobe, rss, home)
     result = [r.to_dict() for r in ranked]
 
     if out_file:
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if return_excluded:
+        excluded_sorted = sorted(
+            excluded_recs,
+            key=lambda r: -(r.published_at.timestamp() if r.published_at else 0.0),
+        )
+        return result, [r.to_dict() for r in excluded_sorted]
 
     return result
