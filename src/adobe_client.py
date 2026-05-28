@@ -341,10 +341,24 @@ def fetch_top_article_urls(
                 best_id, best_hl = pid, hl
         return best_id, best_hl
 
+    # Deduplizierung: m.bild.de und www.bild.de werden unterschiedlich truncated
+    # → Pfade die denselben Prefix (erste 72 Zeichen) teilen, werden zusammengeführt
+    dedup: dict[str, tuple[str, int]] = {}  # prefix → (best_path, total_pv)
+    for path, pv in path_to_pv.items():
+        prefix = path[:72]
+        if prefix in dedup:
+            best, acc = dedup[prefix]
+            # längeren Pfad bevorzugen (mehr ID-Informationen)
+            new_best = path if len(path) > len(best) else best
+            dedup[prefix] = (new_best, acc + pv)
+        else:
+            dedup[prefix] = (path, pv)
+    merged_pv: dict[str, int] = {best: pv for best, pv in dedup.values()}
+
     # Kanonisieren: bild.de ohne www/m
     out: list[dict[str, object]] = []
     seen: set[str] = set()
-    for path, pv in sorted(path_to_pv.items(), key=lambda x: -x[1])[:n]:
+    for path, pv in sorted(merged_pv.items(), key=lambda x: -x[1])[:n]:
         canonical = f"https://bild.de{path}"
         if canonical in seen:
             continue
