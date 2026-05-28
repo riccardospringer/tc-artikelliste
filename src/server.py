@@ -856,8 +856,12 @@ def _enrich_adobe_articles_with_rss(
                         rss_item = item
                         break
             if rss_item:
-                if not a.get("title"):
-                    a["title"] = str(rss_item.get("title") or "")
+                # RSS-Titel hat Vorrang (vollständiger Titel), außer Adobe-Titel ist schon gesetzt
+                rss_title = str(rss_item.get("title") or "").strip()
+                if rss_title:
+                    a["title"] = rss_title
+                elif not a.get("title"):
+                    a["title"] = ""
                 if not a.get("published_at"):
                     pub = _parse_dt(str(rss_item.get("pubDate") or ""))
                     a["published_at"] = pub.isoformat() if pub else None

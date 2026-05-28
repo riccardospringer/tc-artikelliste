@@ -274,6 +274,31 @@ def fetch_top_article_urls(
         if path not in path_to_sample_url:
             path_to_sample_url[path] = dim
 
+    # Schritt 2: Titel aus evar220 (Page ID – Headline)
+    id_to_headline: dict[str, str] = {}
+    try:
+        body_evar220 = {
+            "rsid": _ADOBE_RSID,
+            "globalFilters": [{"type": "dateRange", "dateRange": f"{start}/{end}"}],
+            "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
+            "dimension": "variables/evar220",
+            "settings": {"countRepeatInstances": True, "limit": 500, "nonesBehavior": "exclude-nones"},
+        }
+        evar220_result = _request("POST", "/reports?locale=de_DE", body_evar220)
+        for row in evar220_result.get("rows", []):
+            val = (row.get("value") or "").strip()
+            if " – " in val:
+                page_id, headline = val.split(" – ", 1)
+                page_id = page_id.strip()
+                headline = headline.strip()
+                if headline and page_id:
+                    id_to_headline[page_id] = headline
+    except Exception:
+        pass
+
+    import re as _re
+    _ID_RE = _re.compile(r"([0-9a-f]{24})")
+
     # Kanonisieren: bild.de ohne www/m
     out: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -282,11 +307,17 @@ def fetch_top_article_urls(
         if canonical in seen:
             continue
         seen.add(canonical)
+        # Titel: 24hex-ID aus URL extrahieren → evar220 lookup
+        title = ""
+        m = _ID_RE.search(path)
+        if m:
+            title = id_to_headline.get(m.group(1), "")
         out.append({
             "canonical_url": canonical,
             "source_url": path_to_sample_url.get(path, canonical),
             "live_readers": pv,
             "home_position": None,
+            "title": title,
         })
     return out
 
