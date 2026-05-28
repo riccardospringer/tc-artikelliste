@@ -9,5 +9,5 @@ services:
       - key: TC_CACHE_SECONDS
         value: "30"
       - key: TC_RSS_SOURCE
-        value: http://www.bild.de/rss-feeds/rss-16725492,feed=alles.bild.html
+        value: https://www.bild.de/feed/alles.xml
     healthCheckPath: /healthz
