@@ -341,19 +341,27 @@ def fetch_top_article_urls(
                 best_id, best_hl = pid, hl
         return best_id, best_hl
 
-    # Deduplizierung: m.bild.de und www.bild.de werden unterschiedlich truncated
-    # → Pfade die denselben Prefix (erste 72 Zeichen) teilen, werden zusammengeführt
-    dedup: dict[str, tuple[str, int]] = {}  # prefix → (best_path, total_pv)
-    for path, pv in path_to_pv.items():
-        prefix = path[:72]
-        if prefix in dedup:
-            best, acc = dedup[prefix]
-            # längeren Pfad bevorzugen (mehr ID-Informationen)
-            new_best = path if len(path) > len(best) else best
-            dedup[prefix] = (new_best, acc + pv)
-        else:
-            dedup[prefix] = (path, pv)
-    merged_pv: dict[str, int] = {best: pv for best, pv in dedup.values()}
+    # Deduplizierung: m.bild.de (82 Zeichen Pfad) vs www.bild.de (80 Zeichen Pfad)
+    # → selber Artikel erscheint mit 2 unterschiedlich langen Truncations
+    # Strategie: kürzerer Pfad ist Prefix des längeren → merge
+    sorted_paths = sorted(path_to_pv.keys(), key=len)  # kürzeste zuerst
+    merged: dict[str, int] = {}   # längster_pfad → gesamt_pv
+    _used: set[str] = set()
+    for short_path in sorted_paths:
+        if short_path in _used:
+            continue
+        total_pv = path_to_pv[short_path]
+        best_path = short_path
+        for long_path, long_pv in path_to_pv.items():
+            if long_path == short_path or long_path in _used:
+                continue
+            if long_path.startswith(short_path) and len(short_path) >= 40:
+                total_pv += long_pv
+                best_path = long_path  # längeren Pfad bevorzugen
+                _used.add(long_path)
+        _used.add(short_path)
+        merged[best_path] = merged.get(best_path, 0) + total_pv
+    merged_pv = merged
 
     # Kanonisieren: bild.de ohne www/m
     out: list[dict[str, object]] = []
