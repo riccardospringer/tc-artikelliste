@@ -769,14 +769,26 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
     try:
         urls = [a.get("canonical_url", "") for a in data if a.get("canonical_url")]
         reader_map = _adobe.fetch_live_readers(urls)
-        if reader_map:
+        home_map = {}
+        try:
+            home_map = _adobe.fetch_home_positions(urls)
+        except Exception:
+            pass
+        if reader_map or home_map:
             with _CACHE_LOCK:
                 if _CACHE_DATA is not None:
                     for a in _CACHE_DATA:
                         url = a.get("canonical_url", "")
                         if url in reader_map:
                             a["live_readers"] = reader_map[url]
-                            _recompute_urgency_score(a)
+                        if url in home_map:
+                            a["home_position"] = home_map[url]
+                            if url not in ("source_flags",) and "home" not in (a.get("source_flags") or []):
+                                flags = list(a.get("source_flags") or [])
+                                if "home" not in flags:
+                                    flags.append("home")
+                                a["source_flags"] = sorted(flags)
+                        _recompute_urgency_score(a)
                     # Nach Enrichment neu sortieren
                     _sort_articles_inplace(_CACHE_DATA)
     except Exception:

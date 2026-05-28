@@ -217,6 +217,84 @@ def get_report_suites() -> list[dict]:
     return result.get("content", [])
 
 
+def fetch_home_positions(canonical_urls: list[str]) -> dict[str, int]:
+    """
+    Leitet Homepage-Positionen aus Adobe evar97 (Teaser Block Info) ab.
+    - evar97=aufmacher → Position 1 (Aufmacher)
+    - evar97=aufmacherbereich → Positionen 2-5
+    Gibt {canonical_url: position} zurück. Liefert {} wenn nicht konfiguriert.
+    """
+    if not _is_configured() or not _is_mapping_complete():
+        return {}
+    now_ts = time.time()
+    start = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts - 1 * 3600))
+    end = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts))
+
+    # Schritt 1: evar97 itemIds für "aufmacher" und "aufmacherbereich" holen
+    body_ids = {
+        "rsid": _ADOBE_RSID,
+        "globalFilters": [{"type": "dateRange", "dateRange": f"{start}/{end}"}],
+        "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
+        "dimension": "variables/evar97",
+        "settings": {"countRepeatInstances": True, "limit": 30, "nonesBehavior": "exclude-nones"},
+    }
+    evar97_result = _request("POST", "/reports?locale=de_DE", body_ids)
+    evar97_item_ids: dict[str, str] = {
+        row.get("value", ""): str(row.get("itemId", ""))
+        for row in evar97_result.get("rows", [])
+    }
+
+    blocks = [
+        ("aufmacher", 1, 1),         # Block, Start-Position, Max Artikel
+        ("aufmacherbereich", 2, 4),
+    ]
+
+    path_to_position: dict[str, int] = {}
+    pos_counter = 1
+
+    for block_name, start_pos, max_items in blocks:
+        item_id = evar97_item_ids.get(block_name)
+        if not item_id:
+            continue
+        body_block = {
+            "rsid": _ADOBE_RSID,
+            "globalFilters": [
+                {"type": "dateRange", "dateRange": f"{start}/{end}"},
+                {"type": "breakdown", "dimension": "variables/evar97", "itemIds": [item_id]},
+            ],
+            "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
+            "dimension": _ADOBE_ARTICLE_DIMENSION,
+            "settings": {"countRepeatInstances": True, "limit": max_items, "nonesBehavior": "exclude-nones"},
+        }
+        try:
+            block_result = _request("POST", "/reports?locale=de_DE", body_block)
+        except Exception:
+            continue
+        for idx, row in enumerate(block_result.get("rows", [])[:max_items]):
+            dim = (row.get("value") or "").strip()
+            if not dim or dim == "(Low Traffic)":
+                continue
+            path = _extract_path(dim)
+            if path and path not in path_to_position:
+                path_to_position[path] = start_pos + idx
+
+    # Canonical URLs über Pfad zuordnen
+    out: dict[str, int] = {}
+    for canonical_url in canonical_urls:
+        path = _extract_path(canonical_url)
+        if not path:
+            continue
+        if path in path_to_position:
+            out[canonical_url] = path_to_position[path]
+            continue
+        # Präfix-Match für truncated prop21 URLs
+        for adobe_path, pos in path_to_position.items():
+            if len(adobe_path) >= 50 and path.startswith(adobe_path):
+                out[canonical_url] = pos
+                break
+    return out
+
+
 def _days_ago(n: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(time.time() - n * 86400))
 
