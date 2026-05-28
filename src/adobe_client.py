@@ -11,10 +11,11 @@ ENV-Vars:
   ADOBE_RSID               – Report Suite ID (default: axelspringerbild)
   ADOBE_TOKEN_URL          – OAuth-Token-Endpoint
   ADOBE_ANALYTICS_BASE_URL – Analytics API Base
-  ADOBE_DATE_RANGE_DAYS    – Lookback-Fenster in Tagen (default: 7)
+  ADOBE_DATE_RANGE_DAYS    – Lookback-Fenster in Tagen für Conversions (default: 7)
+  ADOBE_LIVE_READERS_HOURS – Zeitfenster für Live-Leser in Stunden (default: 2)
   ADOBE_LIVE_READERS_METRIC – Metric ID für Live-Leser (default: metrics/pageviews)
   ADOBE_CONVERSION_METRIC  – Metric ID für BILDplus-Abos (default: metrics/event60)
-  ADOBE_ARTICLE_DIMENSION  – Dimension für Artikel-URL/Headline (default: variables/evar12)
+  ADOBE_ARTICLE_DIMENSION  – Dimension für Artikel-URL (default: variables/prop21 = Document URL)
 """
 from __future__ import annotations
 
@@ -42,7 +43,11 @@ _ADOBE_BASE_URL = os.environ.get("ADOBE_ANALYTICS_BASE_URL", "https://analytics.
 _ADOBE_DATE_RANGE_DAYS = max(1, int(os.environ.get("ADOBE_DATE_RANGE_DAYS", "7") or "7"))
 _ADOBE_LIVE_READERS_METRIC = os.environ.get("ADOBE_LIVE_READERS_METRIC", "metrics/pageviews").strip()
 _ADOBE_CONVERSION_METRIC = os.environ.get("ADOBE_CONVERSION_METRIC", "metrics/event60").strip()
-_ADOBE_ARTICLE_DIMENSION = os.environ.get("ADOBE_ARTICLE_DIMENSION", "variables/evar12").strip()
+# prop21 = Document URL (vollständige URL pro Seitenaufruf, präzise für Artikel-Matching)
+# evar12 = Page Headline — NICHT für URL-Matching geeignet
+_ADOBE_ARTICLE_DIMENSION = os.environ.get("ADOBE_ARTICLE_DIMENSION", "variables/prop21").strip()
+# Zeitfenster für Live-Leser: letzte N Stunden (default 2h — "live" Daten)
+_ADOBE_LIVE_READERS_HOURS = max(1, int(os.environ.get("ADOBE_LIVE_READERS_HOURS", "2") or "2"))
 
 _token_lock = threading.Lock()
 _token_cache: dict[str, Any] = {"token": "", "expires_at": 0.0}
@@ -102,6 +107,7 @@ def get_adobe_status() -> dict[str, Any]:
         "adobeArticleDimension": _ADOBE_ARTICLE_DIMENSION,
         "adobeConversionMetricPresent": bool(_ADOBE_CONVERSION_METRIC),
         "adobeConversionMetric": _ADOBE_CONVERSION_METRIC,
+        "adobeLiveReadersHours": _ADOBE_LIVE_READERS_HOURS,
         "adobeTokenStatus": token_status,
         "adobeLastSuccessfulRequestAt": _last_success_ts or None,
         "adobeLastError": _last_error or None,
@@ -215,30 +221,69 @@ def _days_ago(n: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(time.time() - n * 86400))
 
 
+def _extract_path(url: str) -> str:
+    """Extrahiert normalisierten Pfad für URL-Matching (ohne Domain, Query, Fragment)."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url.strip())
+        path = p.path.rstrip("/") or "/"
+        return path.lower()
+    except Exception:
+        return ""
+
+
 def fetch_live_readers(canonical_urls: list[str]) -> dict[str, int]:
     """
-    Gibt {canonical_url: pageviews_today} zurück.
+    Gibt {canonical_url: pageviews_last_N_hours} zurück.
+    Matching über URL-Pfad (domain-agnostisch) für www vs m.bild.de Robustheit.
     Liefert {} wenn nicht konfiguriert — niemals Fake-Werte.
     """
     if not _is_configured() or not _is_mapping_complete():
         return {}
-    today = _days_ago(0)
+    now_ts = time.time()
+    start_ts = now_ts - _ADOBE_LIVE_READERS_HOURS * 3600
+    start = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(start_ts))
+    end = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts))
     body = {
         "rsid": _ADOBE_RSID,
-        "globalFilters": [{"type": "dateRange", "dateRange": f"{today}T00:00:00.000/{today}T23:59:59.000"}],
+        "globalFilters": [{"type": "dateRange", "dateRange": f"{start}/{end}"}],
         "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
         "dimension": _ADOBE_ARTICLE_DIMENSION,
         "settings": {"countRepeatInstances": True, "limit": 50000, "nonesBehavior": "exclude-nones"},
     }
     result = _request("POST", "/reports?locale=de_DE", body)
     rows = result.get("rows", [])
-    url_set = set(canonical_urls)
-    out: dict[str, int] = {}
+
+    # Path-Map aus Adobe-Ergebnissen aufbauen (Domain-agnostisch)
+    path_to_pageviews: dict[str, int] = {}
     for row in rows:
         dim = (row.get("value") or "").strip()
-        if dim in url_set:
-            val = row.get("data", [0])
-            out[dim] = int(val[0]) if val else 0
+        if not dim or dim == "(Low Traffic)":
+            continue
+        path = _extract_path(dim)
+        if not path or path == "/":
+            continue
+        val = row.get("data", [0])
+        pv = int(val[0]) if val and val[0] is not None else 0
+        # m.bild.de + www.bild.de haben denselben Pfad — addieren
+        path_to_pageviews[path] = path_to_pageviews.get(path, 0) + pv
+
+    # Canonical URLs über Pfad zuordnen (prop21 wird auf 100 Zeichen total truncated →
+    # Adobe-Pfad ist häufig ein Präfix des vollen Artikel-Pfades)
+    out: dict[str, int] = {}
+    for canonical_url in canonical_urls:
+        path = _extract_path(canonical_url)
+        if not path:
+            continue
+        # Exakter Match zuerst
+        if path in path_to_pageviews:
+            out[canonical_url] = path_to_pageviews[path]
+            continue
+        # Präfix-Match: Adobe-Pfad kann truncated sein → canonical startswith adobe_path
+        for adobe_path, pv in path_to_pageviews.items():
+            if len(adobe_path) >= 50 and path.startswith(adobe_path):
+                out[canonical_url] = pv
+                break
     return out
 
 
@@ -265,12 +310,14 @@ def test_auth() -> dict[str, object]:
     except Exception as exc:
         result["tokenError"] = str(exc)
         return result
-    # Minimale Analytics-Abfrage: einen Artikel-Eintrag holen
+    # Minimale Analytics-Abfrage: einen URL-Eintrag aus letzter Stunde holen
     try:
-        today = _days_ago(0)
+        now_ts = time.time()
+        start = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts - 3600))
+        end = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts))
         body = {
             "rsid": _ADOBE_RSID,
-            "globalFilters": [{"type": "dateRange", "dateRange": f"{today}T00:00:00.000/{today}T23:59:59.000"}],
+            "globalFilters": [{"type": "dateRange", "dateRange": f"{start}/{end}"}],
             "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
             "dimension": _ADOBE_ARTICLE_DIMENSION,
             "settings": {"countRepeatInstances": True, "limit": 1, "nonesBehavior": "exclude-nones"},
