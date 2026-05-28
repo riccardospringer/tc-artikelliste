@@ -794,33 +794,93 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
         return
     try:
         urls = [a.get("canonical_url", "") for a in data if a.get("canonical_url")]
-        reader_map = _adobe.fetch_live_readers(urls)
-        home_map = {}
+        home_map: dict[str, int] = {}
         try:
             home_map = _adobe.fetch_home_positions(urls)
         except Exception:
             pass
-        if reader_map or home_map:
+        if home_map:
             with _CACHE_LOCK:
                 if _CACHE_DATA is not None:
                     for a in _CACHE_DATA:
                         url = a.get("canonical_url", "")
-                        if url in reader_map:
-                            a["live_readers"] = reader_map[url]
                         if url in home_map:
                             a["home_position"] = home_map[url]
-                            if url not in ("source_flags",) and "home" not in (a.get("source_flags") or []):
-                                flags = list(a.get("source_flags") or [])
-                                if "home" not in flags:
-                                    flags.append("home")
-                                a["source_flags"] = sorted(flags)
+                            flags = list(a.get("source_flags") or [])
+                            if "home" not in flags:
+                                flags.append("home")
+                            a["source_flags"] = sorted(flags)
                         _recompute_urgency_score(a)
-                    # Nach Enrichment neu sortieren
                     _sort_articles_inplace(_CACHE_DATA)
     except Exception:
         pass
     finally:
         _ADOBE_ENRICHMENT_RUNNING.clear()
+
+
+def _enrich_adobe_articles_with_rss(
+    adobe_articles: list[dict[str, object]],
+    rss_src,
+) -> list[dict[str, object]]:
+    """
+    Reichert Adobe-Artikel mit Metadaten aus RSS an (Titel, pubDate, premium, Ressort).
+    Adobe-Artikel die keinen RSS-Match haben behalten leere Metadaten.
+    """
+    if not rss_src:
+        return adobe_articles
+    try:
+        from article_list_mvp import load_rss, canonicalize_url, _detect_ressort, _parse_dt
+        rss_items = load_rss(rss_src)
+        # RSS-Index nach kanonischer URL + Pfad-Präfix
+        rss_by_path: dict[str, dict] = {}
+        for item in rss_items:
+            url = str(item.get("link") or "").strip()
+            if not url:
+                continue
+            from urllib.parse import urlparse
+            path = urlparse(url).path.rstrip("/").lower()
+            if path:
+                rss_by_path[path] = item
+
+        for a in adobe_articles:
+            canon = str(a.get("canonical_url") or "")
+            from urllib.parse import urlparse
+            canon_path = urlparse(canon).path.rstrip("/").lower()
+            rss_item = rss_by_path.get(canon_path)
+            # Präfix-Match wenn kein exakter Treffer
+            if not rss_item:
+                for rss_path, item in rss_by_path.items():
+                    if (len(canon_path) >= 30 and
+                            (rss_path.startswith(canon_path[:50]) or
+                             canon_path.startswith(rss_path[:50]))):
+                        rss_item = item
+                        break
+            if rss_item:
+                if not a.get("title"):
+                    a["title"] = str(rss_item.get("title") or "")
+                if not a.get("published_at"):
+                    pub = _parse_dt(str(rss_item.get("pubDate") or ""))
+                    a["published_at"] = pub.isoformat() if pub else None
+                if not a.get("workflow_status"):
+                    prem = str(rss_item.get("premium") or "").strip().lower()
+                    a["workflow_status"] = "BILD+" if prem == "true" else ("Frei" if prem == "false" else "")
+                if not a.get("ressort"):
+                    a["ressort"] = _detect_ressort(canon)
+                a.setdefault("source_flags", [])
+                if "rss" not in a["source_flags"]:
+                    a["source_flags"] = sorted(set(a["source_flags"]) | {"rss", "adobe"})
+            else:
+                # Kein RSS-Match: Ressort aus URL ableiten
+                if not a.get("ressort"):
+                    a["ressort"] = _detect_ressort(canon)
+                a.setdefault("workflow_status", "")
+                a.setdefault("title", "")
+                a.setdefault("published_at", None)
+                a.setdefault("source_flags", ["adobe"])
+            a.setdefault("cms_id", "")
+    except Exception:
+        pass
+    return adobe_articles
 
 
 def _do_fetch_articles(
@@ -838,6 +898,22 @@ def _do_fetch_articles(
         except Exception:
             if EDITORIAL_ONE_STRICT:
                 raise
+
+    # Adobe als primäre Quelle wenn konfiguriert
+    if _ADOBE_AVAILABLE and _adobe.get_adobe_status().get("adobeConfigured"):
+        try:
+            adobe_articles = _adobe.fetch_top_article_urls(n=100)
+            if adobe_articles:
+                # Metadaten aus RSS anreichern
+                adobe_articles = _enrich_adobe_articles_with_rss(adobe_articles, rss_src)
+                # Scores berechnen
+                for a in adobe_articles:
+                    _recompute_urgency_score(a)
+                _sort_articles_inplace(adobe_articles)
+                return adobe_articles, []
+        except Exception:
+            pass  # Fallback auf RSS-only
+
     result = run_mvp(
         adobe_file=adobe_src,
         rss_file=rss_src,

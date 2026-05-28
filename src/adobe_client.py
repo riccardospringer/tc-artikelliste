@@ -217,6 +217,80 @@ def get_report_suites() -> list[dict]:
     return result.get("content", [])
 
 
+_ARTICLE_PATH_EXCLUDES = {"/adblockwall.html", "/", ""}
+_ARTICLE_PATH_PREFIXES = (
+    "/news/", "/politik/", "/sport/", "/unterhaltung/", "/regional/",
+    "/leben-wissen/", "/ratgeber/", "/auto/", "/geld/", "/lifestyle/",
+    "/bild-plus/", "/bildplus/",
+)
+
+
+def fetch_top_article_urls(
+    n: int = 100,
+    hours: int | None = None,
+) -> list[dict[str, object]]:
+    """
+    Gibt die Top-n Artikel aus Adobe (nach Pageviews) zurück.
+    Nutzt prop21-Dimension, aggregiert m.bild.de + www.bild.de.
+    Liefert [] wenn nicht konfiguriert.
+
+    Rückgabe: [{"canonical_url": str, "live_readers": int, "home_position": None}]
+    """
+    if not _is_configured() or not _is_mapping_complete():
+        return []
+    look = hours or _ADOBE_LIVE_READERS_HOURS
+    now_ts = time.time()
+    start = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts - look * 3600))
+    end = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts))
+    body = {
+        "rsid": _ADOBE_RSID,
+        "globalFilters": [{"type": "dateRange", "dateRange": f"{start}/{end}"}],
+        "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
+        "dimension": _ADOBE_ARTICLE_DIMENSION,
+        "settings": {"countRepeatInstances": True, "limit": n * 3, "nonesBehavior": "exclude-nones"},
+    }
+    result = _request("POST", "/reports?locale=de_DE", body)
+    rows = result.get("rows", [])
+
+    path_to_pv: dict[str, int] = {}
+    path_to_sample_url: dict[str, str] = {}
+    for row in rows:
+        dim = (row.get("value") or "").strip()
+        if not dim or dim == "(Low Traffic)":
+            continue
+        try:
+            from urllib.parse import urlparse as _up
+            parsed = _up(dim)
+            path = parsed.path.rstrip("/").lower()
+        except Exception:
+            continue
+        if not path or path in _ARTICLE_PATH_EXCLUDES:
+            continue
+        if not any(path.startswith(p) for p in _ARTICLE_PATH_PREFIXES):
+            continue
+        val = row.get("data", [0])
+        pv = int(val[0]) if val and val[0] is not None else 0
+        path_to_pv[path] = path_to_pv.get(path, 0) + pv
+        if path not in path_to_sample_url:
+            path_to_sample_url[path] = dim
+
+    # Kanonisieren: bild.de ohne www/m
+    out: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for path, pv in sorted(path_to_pv.items(), key=lambda x: -x[1])[:n]:
+        canonical = f"https://bild.de{path}"
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        out.append({
+            "canonical_url": canonical,
+            "source_url": path_to_sample_url.get(path, canonical),
+            "live_readers": pv,
+            "home_position": None,
+        })
+    return out
+
+
 def fetch_home_positions(canonical_urls: list[str]) -> dict[str, int]:
     """
     Leitet Homepage-Positionen aus Adobe evar97 (Teaser Block Info) ab.
