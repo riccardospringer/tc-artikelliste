@@ -852,15 +852,24 @@ def _enrich_adobe_articles_with_es(
     """
     if not _ES_AVAILABLE:
         return adobe_articles
-    es_articles = _es.fetch_articles()
+    es_articles = _es.fetch_articles()  # groups/0 = aktuell publiziert
+
+    # IDs der aktuell publizierten Artikel für Status-Bestimmung
+    published_ids: set[str] = {a.get("document_id", "") for a in es_articles if a.get("document_id")}
 
     # Ältere Artikel aus groups/1 für URL-Lookup dazuholen
+    # Artikel die in groups/1 aber NICHT in groups/0 = redigiert/zum verbauen
     if include_all_articles:
         try:
             all_es = _es.fetch_all_articles_for_lookup()
             existing_ids = {a.get("document_id", "") for a in es_articles}
             for a in all_es:
-                if a.get("document_id") and a["document_id"] not in existing_ids:
+                doc_id = a.get("document_id", "")
+                if doc_id and doc_id not in existing_ids:
+                    # Nicht mehr in groups/0 → redigiert (hat echte URL) oder zum verbauen
+                    if "/cmsid/" not in a.get("source_url", ""):
+                        a = dict(a)
+                        a["workflow_status"] = "redigiert"
                     es_articles.append(a)
         except Exception:
             pass
