@@ -398,13 +398,13 @@ def fetch_top_article_urls(
         if canonical in seen:
             continue
         seen.add(canonical)
-        _, title = _best_headline(path)
+        article_page_id, title = _best_headline(path)
         # Publikationsdatum aus MongoDB ObjectID: erste 4 Bytes = Unix-Timestamp
-        # page_id (aus evar220) ist vollständig, URL-ID oft truncated → page_id bevorzugt
+        # article_page_id (aus evar220-Match) ist vollständig, URL-ID oft truncated
         import datetime as _dt
         pub_date: str | None = None
         url_id_match = _re.search(r"([0-9a-f]{24})", canonical)
-        for id_src in [page_id, url_id_match.group(1) if url_id_match else ""]:
+        for id_src in [article_page_id, url_id_match.group(1) if url_id_match else ""]:
             if len(id_src) >= 8:
                 try:
                     ts = int(id_src[:8], 16)
