@@ -231,16 +231,23 @@ _SECTION_PAGE_PATTERNS = (
 
 def _is_article_path(path: str) -> bool:
     """Prüft ob der Pfad ein echter Artikel ist (keine Sektions-Seite)."""
+    lower = path.lower()
+    # Alte URL-Formate: .bild.html, .bildmobile, .bild
+    if any(lower.endswith(s) for s in (".bild.html", ".bildmobile", ".bild", ".html.bild")):
+        return False
+    # Sektions-Pfadsegment: /startseite/ oder /home/
+    if "/startseite/" in lower or "/startseite" == lower.rstrip("/")[-11:]:
+        return False
     last = path.rstrip("/").split("/")[-1]
-    # Alte .bild Format-IDs wie "16804710.bild"
-    if last.endswith(".bild") or last.endswith(".html.bild"):
+    # Numerische Artikel-IDs (altes Format: "15479124.bild")
+    import re as _re2
+    if _re2.match(r"^\d{6,}[.\-]", last):
         return False
     # Sehr kurze Slugs = wahrscheinlich Sektions-Seite
     parts = [p for p in last.split("-") if len(p) > 2]
     if len(parts) < 2:
         return False
     # Sektions-Startseite-Muster
-    lower = path.lower()
     if any(p in lower for p in _SECTION_PAGE_PATTERNS):
         return False
     return True
