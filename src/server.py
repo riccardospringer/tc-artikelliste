@@ -990,10 +990,15 @@ def _do_fetch_articles(
         try:
             adobe_articles = _adobe.fetch_top_article_urls(n=100)
             if adobe_articles:
-                # ES-Feed für Metadaten nutzen wenn verfügbar (documentId-Matching)
+                editing_articles: list[dict[str, object]] = []
+                # ES-Feed für Metadaten + Editing-Artikel nutzen
                 if _ES_AVAILABLE and _es.get_status().get("esFeedConfigured"):
                     try:
                         adobe_articles = _enrich_adobe_articles_with_es(adobe_articles)
+                    except Exception:
+                        pass
+                    try:
+                        editing_articles = _es.fetch_editing_articles()
                     except Exception:
                         pass
                 # Restliche ohne ES-Metadaten aus RSS anreichern
@@ -1002,7 +1007,7 @@ def _do_fetch_articles(
                 for a in adobe_articles:
                     _recompute_urgency_score(a)
                 _sort_articles_inplace(adobe_articles)
-                return adobe_articles, []
+                return adobe_articles, editing_articles
         except Exception:
             pass  # Fallback auf RSS-only
 

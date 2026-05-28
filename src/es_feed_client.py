@@ -218,3 +218,76 @@ def fetch_articles() -> list[dict[str, Any]]:
             "urgency_score": 0,
         })
     return out
+
+
+def _fetch_group(token: str, group_id: int) -> list[dict[str, Any]]:
+    feed_base = _ES_FEED_URL.rsplit("/document-groups/", 1)[0]
+    url = f"{feed_base}/document-groups/{group_id}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "x-api-key": _ES_API_KEY,
+    })
+    with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as resp:
+        data = json.loads(resp.read())
+    return data.get("documents", []) if isinstance(data, dict) else []
+
+
+def fetch_editing_articles() -> list[dict[str, Any]]:
+    """
+    Holt Artikel in Bearbeitung (nicht publiziert) aus document-groups/1.
+    Workflow-Status:
+      - liveUrl mit echtem Slug → 'redigiert' (bereit zum Publizieren)
+      - liveUrl mit /cmsid/ → 'zum verbauen' (noch in Arbeit)
+    Gibt [] zurück wenn nicht konfiguriert.
+    """
+    if not _is_configured():
+        return []
+    token = _get_token()
+    published_docs = _fetch_group(token, 0)
+    all_docs = _fetch_group(token, 1)
+    published_ids = {d.get("documentId") for d in published_docs if d.get("documentId")}
+
+    out: list[dict[str, Any]] = []
+    for doc in all_docs:
+        doc_id = str(doc.get("documentId") or "").strip()
+        if doc_id in published_ids:
+            continue  # bereits publiziert → nicht im zweiten Tab
+        live_url = str(doc.get("liveUrl") or "").strip()
+        # Workflow-Status ableiten
+        if "/cmsid/" in live_url or not live_url:
+            workflow = "zum verbauen"
+            canonical = f"https://bild.de/cmsid/{doc_id}" if doc_id else ""
+        else:
+            workflow = "redigiert"
+            from urllib.parse import urlparse
+            p = urlparse(live_url)
+            host = p.netloc.lower().replace("www.", "").replace("m.", "")
+            path = p.path.rstrip("/")
+            canonical = f"https://{host}{path}"
+
+        headline = _parse_text(doc.get("headline"))
+        kicker = _parse_text(doc.get("kicker"))
+        full_title = f"{kicker} – {headline}" if kicker and headline else (headline or kicker)
+
+        channel = doc.get("primaryChannel") or {}
+        channel_name = channel.get("name", "") if isinstance(channel, dict) else str(channel)
+        ressort = _detect_ressort(channel_name)
+        premium = bool(doc.get("premium", False))
+        pub_date = str(doc.get("documentPublicationDate") or doc.get("modificationDate") or "")
+
+        out.append({
+            "document_id": doc_id,
+            "canonical_url": canonical,
+            "source_url": live_url,
+            "cms_id": doc_id,
+            "title": full_title,
+            "workflow_status": workflow,
+            "live_readers": 0,
+            "home_position": None,
+            "published_at": pub_date,
+            "ressort": ressort,
+            "source_flags": ["es_feed"],
+            "urgency_score": 0,
+        })
+    return out
