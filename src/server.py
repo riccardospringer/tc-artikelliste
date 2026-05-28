@@ -718,6 +718,7 @@ EDITORIAL_ONE_PYC = os.environ.get(
 _CACHE_LOCK = threading.Lock()
 _CACHE_DATA: list[dict[str, object]] | None = None
 _CACHE_EXPIRES_AT = 0.0
+_LOAD_IN_PROGRESS = threading.Lock()  # verhindert parallele Lade-Vorgänge
 _EDITORIAL_ONE_MODULE = None
 _EDITORIAL_ONE_MODULE_LOCK = threading.Lock()
 _ADOBE_ENRICHMENT_RUNNING = threading.Event()
@@ -743,6 +744,26 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
         _ADOBE_ENRICHMENT_RUNNING.clear()
 
 
+def _do_fetch_articles(force_refresh: bool, adobe_src, rss_src, home_src) -> list[dict[str, object]]:
+    """Führt den eigentlichen Datenabruf durch — OHNE Lock, kann lange dauern."""
+    if EDITORIAL_ONE_ENABLED:
+        try:
+            editorial_one_data = _load_editorial_one_articles(force_refresh=force_refresh)
+            if editorial_one_data:
+                return editorial_one_data
+            if EDITORIAL_ONE_STRICT:
+                raise RuntimeError("Editorial-One lieferte keine Artikel")
+        except Exception:
+            if EDITORIAL_ONE_STRICT:
+                raise
+    return run_mvp(
+        adobe_file=adobe_src,
+        rss_file=rss_src,
+        home_file=home_src,
+        api_check=API_CHECK,
+    )
+
+
 def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
     global _CACHE_DATA, _CACHE_EXPIRES_AT
 
@@ -750,7 +771,13 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
     if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
         return _CACHE_DATA
 
-    with _CACHE_LOCK:
+    # Wenn bereits ein Ladevorgang läuft: sofort stale/leere Daten zurückgeben
+    # (verhindert, dass HTTP-Requests auf den Render-Proxy-Timeout von 5s warten)
+    if not _LOAD_IN_PROGRESS.acquire(blocking=False):
+        return _CACHE_DATA if _CACHE_DATA is not None else []
+
+    try:
+        # Double-check nach Lock-Erwerb
         now = time.monotonic()
         if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
             return _CACHE_DATA
@@ -765,56 +792,31 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
         if _no_sources_now:
             return []
 
-        # Im real-data-mode keine Fixture-Quellen laden — verhindert Mischung.
-        # Fixture-Quellen nur wenn FIXTURE_MODE_EXPLICIT gesetzt ist.
         _adobe_src = ADOBE_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(ADOBE_SOURCE)) else None
         _rss_src = RSS_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(RSS_SOURCE)) else None
         _home_src = HOME_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(HOME_SOURCE)) else None
 
-        if EDITORIAL_ONE_ENABLED:
-            try:
-                editorial_one_data = _load_editorial_one_articles(force_refresh=force_refresh)
-                if editorial_one_data:
-                    data = editorial_one_data
-                elif EDITORIAL_ONE_STRICT:
-                    raise RuntimeError("Editorial-One lieferte keine Artikel")
-                else:
-                    data = run_mvp(
-                        adobe_file=_adobe_src,
-                        rss_file=_rss_src,
-                        home_file=_home_src,
-                        api_check=API_CHECK,
-                    )
-            except Exception:
-                if EDITORIAL_ONE_STRICT:
-                    raise
-                data = run_mvp(
-                    adobe_file=_adobe_src,
-                    rss_file=_rss_src,
-                    home_file=_home_src,
-                    api_check=API_CHECK,
-                )
-        else:
-            data = run_mvp(
-                adobe_file=_adobe_src,
-                rss_file=_rss_src,
-                home_file=_home_src,
-                api_check=API_CHECK,
-            )
-        # Adobe Live-Reader-Enrichment: im Hintergrund, damit Render-Proxy-Timeout (5s) nicht greift
+        # RSS-Fetch läuft ohne Cache-Lock — dauert >5s, darf andere Requests nicht blockieren
+        data = _do_fetch_articles(force_refresh, _adobe_src, _rss_src, _home_src)
+
+        # Adobe Live-Reader-Enrichment: im Hintergrund
         if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
             if not _ADOBE_ENRICHMENT_RUNNING.is_set():
                 _ADOBE_ENRICHMENT_RUNNING.set()
                 t = threading.Thread(target=_run_adobe_enrichment_async, args=(data,), daemon=True)
                 t.start()
 
-        if CACHE_SECONDS > 0:
-            _CACHE_DATA = data
-            _CACHE_EXPIRES_AT = time.monotonic() + CACHE_SECONDS
-        else:
-            _CACHE_DATA = data
-            _CACHE_EXPIRES_AT = 0.0
+        # Ergebnis kurz im Cache schreiben (sehr schnell)
+        with _CACHE_LOCK:
+            if CACHE_SECONDS > 0:
+                _CACHE_DATA = data
+                _CACHE_EXPIRES_AT = time.monotonic() + CACHE_SECONDS
+            else:
+                _CACHE_DATA = data
+                _CACHE_EXPIRES_AT = 0.0
         return data
+    finally:
+        _LOAD_IN_PROGRESS.release()
 
 
 class Handler(BaseHTTPRequestHandler):
