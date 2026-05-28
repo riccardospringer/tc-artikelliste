@@ -1006,7 +1006,29 @@ if __name__ == "__main__":
         print(f"UI lokal: http://{host}:{actual_port}{_with_base_path('/')}")
         print(f"API lokal: http://{host}:{actual_port}{_with_base_path('/api/articles')}")
         print(f"Health lokal: http://{host}:{actual_port}{_with_base_path('/healthz')}")
-    # Artikel im Hintergrund vorladen damit der Cache beim ersten Request warm ist
-    if not NO_SOURCES_STATE:
-        threading.Thread(target=load_articles, kwargs={"force_refresh": True}, daemon=True).start()
+    # Startup-Preload: Lock im Hauptthread acquirieren BEVOR Connections akzeptiert werden.
+    # → Eingehende /api/articles Requests erhalten sofort [] (kein Warten, kein 502)
+    # → Sobald Preload fertig, wird Lock freigegeben und Cache ist warm.
+    if not NO_SOURCES_STATE and _LOAD_IN_PROGRESS.acquire(blocking=False):
+        def _startup_preload_worker():
+            try:
+                _adobe_src = ADOBE_SOURCE if not _is_fixture(ADOBE_SOURCE) else None
+                _rss_src = RSS_SOURCE if not _is_fixture(RSS_SOURCE) else None
+                _home_src = HOME_SOURCE if not _is_fixture(HOME_SOURCE) else None
+                data = _do_fetch_articles(True, _adobe_src, _rss_src, _home_src)
+                with _CACHE_LOCK:
+                    global _CACHE_DATA, _CACHE_EXPIRES_AT
+                    _CACHE_DATA = data
+                    _CACHE_EXPIRES_AT = time.monotonic() + (CACHE_SECONDS if CACHE_SECONDS > 0 else 0.0)
+                if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
+                    if not _ADOBE_ENRICHMENT_RUNNING.is_set():
+                        _ADOBE_ENRICHMENT_RUNNING.set()
+                        threading.Thread(
+                            target=_run_adobe_enrichment_async, args=(data,), daemon=True,
+                        ).start()
+            except Exception:
+                pass
+            finally:
+                _LOAD_IN_PROGRESS.release()
+        threading.Thread(target=_startup_preload_worker, daemon=True).start()
     server.serve_forever()
