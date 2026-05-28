@@ -621,8 +621,13 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
           populateRessortFilter();
           render();
           const now = new Date().toLocaleTimeString('de-DE', {{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
-          updateStatus(`${{allArticles.length}} Artikel · Stand: ${{now}}`);
-          resetCountdown();
+          if (allArticles.length === 0 && activeTab === 'main') {{
+            updateStatus('Server lädt… Retry in 5s');
+            setTimeout(() => loadData(false), 5000);
+          }} else {{
+            updateStatus(`${{allArticles.length}} Artikel · Stand: ${{now}}`);
+            resetCountdown();
+          }}
         }})
         .catch(e => {{ updateStatus('Fehler: ' + e.message); }});
     }}
