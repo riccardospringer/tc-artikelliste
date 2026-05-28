@@ -313,7 +313,13 @@ def fetch_top_article_urls(
 
     def _headline_words(headline: str) -> set[str]:
         words = _re.findall(r"[a-züäöß]{3,}", headline.lower())
-        return set(w for w in words if w not in _STOP)
+        result = set()
+        for w in words:
+            if w not in _STOP:
+                # ASCII-Normalisierung für Matching mit URL-Slugs (traegt = trägt)
+                w_ascii = w.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+                result.add(w_ascii)
+        return result
 
     # Headline-Word-Index für schnelles Matching
     headline_entries = [(page_id, headline, _headline_words(headline))

@@ -345,8 +345,8 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
     td.title {{ max-width: 280px; }}
     td.title a {{ color: #1a1a1a; text-decoration: none; font-weight: 500; word-break: break-word; }}
     td.title a:hover {{ color: #d0021b; text-decoration: underline; }}
-    td.url {{ max-width: 200px; }}
-    td.url a {{ color: #555; font-size: 11px; word-break: break-all; }}
+    td.url {{ max-width: 340px; }}
+    td.url a {{ color: #555; font-size: 11px; word-break: break-all; white-space: normal; }}
     td.url a:hover {{ color: #d0021b; }}
     .status-pill {{ display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 500; background: #e8f5e9; color: #1b5e20; }}
     .status-pill.unknown {{ background: #fff3e0; color: #7f4f00; }}
@@ -535,7 +535,7 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
         const rank = a._rank ?? (i + 1);
         const isTop5 = rank <= 5;
         const score = a.urgency_score ?? 0;
-        const url = a.canonical_url || a.source_url || '';
+        const url = a.source_url || a.canonical_url || '';
         const title = a.title || url;
         const statusCls = a.workflow_status ? '' : ' unknown';
         const statusLabel = a.workflow_status || 'unbekannt';
