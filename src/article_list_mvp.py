@@ -180,10 +180,20 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+_TZ_ABBREV = {
+    "CEST": "+0200", "CET": "+0100", "GMT": "+0000", "UTC": "+0000",
+    "EDT": "-0400", "EST": "-0500", "PDT": "-0700", "PST": "-0800",
+}
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
     txt = value.strip()
+    for abbrev, offset in _TZ_ABBREV.items():
+        if txt.endswith(" " + abbrev):
+            txt = txt[: -(len(abbrev))] + offset
+            break
     formats = [
         "%a, %d %b %Y %H:%M:%S %z",  # RFC822
         "%Y-%m-%dT%H:%M:%S%z",
@@ -485,6 +495,13 @@ def _normalize_rss_rows(rss_items: list[dict[str, Any]]) -> list[IngestRow]:
         cms_id = _extract_cms_id(url, str(item.get("cms_id") or ""))
         if not canonical and not cms_id:
             continue
+        wf = _pick_first(item, RSS_WORKFLOW_STATUS_FIELD_ALIASES)
+        if not wf:
+            premium_raw = str(item.get("premium") or "").strip().lower()
+            if premium_raw == "true":
+                wf = "BILD+"
+            elif premium_raw == "false":
+                wf = "Frei"
         normalized.append(
             IngestRow(
                 source="rss",
@@ -492,10 +509,7 @@ def _normalize_rss_rows(rss_items: list[dict[str, Any]]) -> list[IngestRow]:
                 source_url=url,
                 cms_id=cms_id,
                 title=str(item.get("title") or ""),
-                workflow_status=_pick_first(
-                    item,
-                    RSS_WORKFLOW_STATUS_FIELD_ALIASES,
-                ),
+                workflow_status=wf,
                 rss_guid=str(item.get("guid") or ""),
                 published_at=_parse_dt(str(item.get("pubDate") or item.get("published_at") or "")),
                 ressort=_detect_ressort(canonical or url),
