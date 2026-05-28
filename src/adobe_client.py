@@ -319,14 +319,29 @@ def fetch_top_article_urls(
     headline_entries = [(page_id, headline, _headline_words(headline))
                         for page_id, headline in id_to_headline.items()]
 
+    _ASCII_TO_DE = {"ae": "ä", "oe": "ö", "ue": "ü", "Ae": "Ä", "Oe": "Ö", "Ue": "Ü",
+                    "fuer": "für", "ueber": "über", "ss": "ß"}
+
     def _title_from_slug(path: str) -> str:
-        """Fallback-Titel aus URL-Slug wenn kein evar220-Match."""
+        """Fallback-Titel aus URL-Slug: bereinigt, kapitalisiert, Umlaute repariert."""
         last = path.rstrip("/").split("/")[-1]
-        # Trailing IDs entfernen: -6a17... oder -6a16b etc.
+        # Trailing IDs und letztes unvollständiges Wort entfernen
         clean = _re.sub(r"-[0-9a-f]{5,}[^a-z]*$", "", last)
         clean = _re.sub(r"\.html$", "", clean)
-        clean = clean.replace("-", " ").replace("_", " ").strip()
-        return clean[:1].upper() + clean[1:] if clean else ""
+        # Letztes Wort entfernen wenn Pfad truncated war (endet nicht sauber mit Bindestr.)
+        if len(path) >= 79 and not path.endswith("-"):
+            # Truncated — letztes möglicherweise unvollständiges Wort abschneiden
+            parts = clean.rsplit("-", 1)
+            if len(parts) == 2 and len(parts[1]) < 5:
+                clean = parts[0]
+        words = [w for w in clean.split("-") if w]
+        # ASCII-Umlaute reparieren und kapitalisieren
+        result_words = []
+        for w in words:
+            w_lower = w.lower()
+            w = _ASCII_TO_DE.get(w_lower, w)
+            result_words.append(w[:1].upper() + w[1:] if w else "")
+        return " ".join(result_words) if result_words else ""
 
     def _best_headline(path: str) -> tuple[str, str]:
         """Gibt (page_id, headline) mit bestem Slug-Wort-Match zurück.
@@ -345,7 +360,7 @@ def fetch_top_article_urls(
                 if not hl_words:
                     continue
                 overlap = len(slug_w & hl_words)
-                if overlap >= 3 and overlap > best_score:
+                if overlap >= 2 and overlap > best_score:
                     best_score = overlap
                     best_id, best_hl = pid, hl
             if best_hl:
