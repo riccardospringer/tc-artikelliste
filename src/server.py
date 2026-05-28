@@ -958,7 +958,8 @@ def _enrich_adobe_articles_with_rss(
                 # Kein RSS-Match: Ressort aus URL ableiten
                 if not a.get("ressort"):
                     a["ressort"] = _detect_ressort(canon)
-                a.setdefault("workflow_status", "")
+                if not a.get("workflow_status"):
+                    a["workflow_status"] = "Frei"  # Default für Adobe-only
                 a.setdefault("title", "")
                 a.setdefault("published_at", None)
                 a.setdefault("source_flags", ["adobe"])

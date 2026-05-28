@@ -399,12 +399,27 @@ def fetch_top_article_urls(
             continue
         seen.add(canonical)
         _, title = _best_headline(path)
+        # Publikationsdatum aus MongoDB ObjectID (erste 4 Bytes = Unix-Timestamp)
+        import re as _id_re
+        pub_date: str | None = None
+        id_match = _re.search(r"([0-9a-f]{24})", canonical)
+        if id_match:
+            try:
+                import datetime as _dt
+                ts = int(id_match.group(1)[:8], 16)
+                if 1600000000 < ts < 2000000000:  # plausible 2020-2033
+                    pub_date = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).isoformat()
+            except Exception:
+                pass
+
         out.append({
             "canonical_url": canonical,
             "source_url": path_to_sample_url.get(path, canonical),
             "live_readers": pv,
             "home_position": None,
             "title": title,
+            "published_at": pub_date,
+            "workflow_status": "Frei",  # Default für Adobe-Artikel ohne Premium-Info
         })
     return out
 
