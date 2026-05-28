@@ -22,6 +22,13 @@ except ImportError:
     _adobe = None  # type: ignore[assignment]
     _ADOBE_AVAILABLE = False
 
+try:
+    import es_feed_client as _es
+    _ES_AVAILABLE = True
+except ImportError:
+    _es = None  # type: ignore[assignment]
+    _ES_AVAILABLE = False
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 ADOBE = BASE_DIR / "fixtures" / "adobe_sample.json"
 RSS = BASE_DIR / "fixtures" / "rss_sample.xml"
@@ -818,6 +825,80 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
         _ADOBE_ENRICHMENT_RUNNING.clear()
 
 
+def _enrich_adobe_articles_with_es(
+    adobe_articles: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """
+    Reichert Adobe-Artikel mit Metadaten aus dem ES-Feed an.
+    Matching: documentId (24-hex) aus Artikel-URL vs ES-Feed documentId.
+    ES-Feed-Artikel die nicht in Adobe-Liste sind werden HINZUGEFÜGT.
+    """
+    if not _ES_AVAILABLE:
+        return adobe_articles
+    es_articles = _es.fetch_articles()
+    if not es_articles:
+        return adobe_articles
+
+    import re as _re
+    _ID_RE = _re.compile(r"([0-9a-f]{24})")
+
+    # ES-Index: documentId → ES-Artikel
+    es_by_id: dict[str, dict] = {a["document_id"]: a for a in es_articles if a.get("document_id")}
+    # ES-Index: canonical_url-Pfad → ES-Artikel
+    from urllib.parse import urlparse
+    es_by_path: dict[str, dict] = {}
+    for a in es_articles:
+        if a.get("canonical_url"):
+            path = urlparse(a["canonical_url"]).path.rstrip("/").lower()
+            if path:
+                es_by_path[path] = a
+
+    # Adobe-Artikel mit ES-Metadaten anreichern
+    adobe_ids_matched: set[str] = set()
+    for a in adobe_articles:
+        canon = str(a.get("canonical_url") or "")
+        # Versuche documentId aus URL extrahieren
+        m = _ID_RE.search(canon)
+        doc_id = m.group(1) if m else ""
+        es = es_by_id.get(doc_id) if doc_id else None
+        if not es:
+            path = urlparse(canon).path.rstrip("/").lower()
+            es = es_by_path.get(path)
+            if not es:
+                # Präfix-Match für truncated Adobe URLs
+                for es_path, es_a in es_by_path.items():
+                    if (len(path) >= 30 and es_path.startswith(path[:60])) or \
+                       (len(es_path) >= 30 and path.startswith(es_path[:60])):
+                        es = es_a
+                        break
+        if es:
+            adobe_ids_matched.add(es.get("document_id", ""))
+            if not a.get("title") or str(a.get("title","")).strip() == "":
+                a["title"] = es.get("title", "")
+            a["workflow_status"] = es.get("workflow_status", a.get("workflow_status", ""))
+            a["ressort"] = es.get("ressort") or a.get("ressort", "")
+            if not a.get("published_at"):
+                a["published_at"] = es.get("published_at")
+            a["cms_id"] = es.get("document_id", "")
+            flags = list(a.get("source_flags") or [])
+            if "es_feed" not in flags:
+                flags.append("es_feed")
+            a["source_flags"] = sorted(flags)
+
+    # ES-Artikel die nicht in Adobe-Liste sind hinzufügen (neueste publizierten Artikel)
+    existing_canonical = {str(a.get("canonical_url","")) for a in adobe_articles}
+    for es_a in es_articles:
+        es_doc_id = es_a.get("document_id", "")
+        es_canon = es_a.get("canonical_url", "")
+        if es_doc_id in adobe_ids_matched:
+            continue
+        if es_canon in existing_canonical:
+            continue
+        # Nicht in Adobe → als neuer Artikel hinzufügen (live_readers=0)
+        adobe_articles.append(es_a)
+    return adobe_articles
+
+
 def _enrich_adobe_articles_with_rss(
     adobe_articles: list[dict[str, object]],
     rss_src,
@@ -908,7 +989,13 @@ def _do_fetch_articles(
         try:
             adobe_articles = _adobe.fetch_top_article_urls(n=100)
             if adobe_articles:
-                # Metadaten aus RSS anreichern
+                # ES-Feed für Metadaten nutzen wenn verfügbar (documentId-Matching)
+                if _ES_AVAILABLE and _es.get_status().get("esFeedConfigured"):
+                    try:
+                        adobe_articles = _enrich_adobe_articles_with_es(adobe_articles)
+                    except Exception:
+                        pass
+                # Restliche ohne ES-Metadaten aus RSS anreichern
                 adobe_articles = _enrich_adobe_articles_with_rss(adobe_articles, rss_src)
                 # Scores berechnen
                 for a in adobe_articles:
@@ -1053,6 +1140,7 @@ class Handler(BaseHTTPRequestHandler):
                     "fixture_mode_explicit": FIXTURE_MODE_EXPLICIT,
                     "no_sources_state": NO_SOURCES_STATE,
                     "adobe": _adobe.get_adobe_status() if _ADOBE_AVAILABLE else {"adobeConfigured": False},
+                    "es_feed": _es.get_status() if _ES_AVAILABLE else {"esFeedConfigured": False},
                     "editorial_one_enabled": EDITORIAL_ONE_ENABLED,
                     "editorial_one_strict": EDITORIAL_ONE_STRICT,
                     "editorial_one_hours": EDITORIAL_ONE_HOURS if EDITORIAL_ONE_ENABLED else None,
