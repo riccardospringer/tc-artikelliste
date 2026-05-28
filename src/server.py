@@ -724,6 +724,16 @@ _EDITORIAL_ONE_MODULE_LOCK = threading.Lock()
 _ADOBE_ENRICHMENT_RUNNING = threading.Event()
 
 
+def _recompute_urgency_score(article: dict[str, object]) -> None:
+    """Urgency-Score nach live_readers-Update neu berechnen."""
+    live_r = _safe_int(article.get("live_readers"), default=0)
+    home_pos_raw = article.get("home_position")
+    home_pos = _safe_int(home_pos_raw, default=0) if home_pos_raw is not None else None
+    home_score = max(0, 100 - (home_pos - 1) * 5) if home_pos else 0
+    readers_score = min(100, live_r / 100)
+    article["urgency_score"] = round(0.6 * home_score + 0.4 * readers_score)
+
+
 def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
     """Holt Live-Leser im Hintergrund und aktualisiert den Cache direkt."""
     if not _ADOBE_AVAILABLE:
@@ -738,6 +748,7 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
                         url = a.get("canonical_url", "")
                         if url in reader_map:
                             a["live_readers"] = reader_map[url]
+                            _recompute_urgency_score(a)
     except Exception:
         pass
     finally:
@@ -798,6 +809,23 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
 
         # RSS-Fetch läuft ohne Cache-Lock — dauert >5s, darf andere Requests nicht blockieren
         data = _do_fetch_articles(force_refresh, _adobe_src, _rss_src, _home_src)
+
+        # Alte live_readers-Werte aus dem Cache in neue Artikel übernehmen
+        # (verhindert Flash of 0 zwischen RSS-Refresh und Adobe-Enrichment)
+        with _CACHE_LOCK:
+            old_cache = _CACHE_DATA
+        if old_cache and data:
+            old_readers: dict[str, int] = {
+                str(a.get("canonical_url", "")): _safe_int(a.get("live_readers"), default=0)
+                for a in old_cache if a.get("live_readers")
+            }
+            if old_readers:
+                for a in data:
+                    url = str(a.get("canonical_url", ""))
+                    old_val = old_readers.get(url, 0)
+                    if old_val > 0 and _safe_int(a.get("live_readers"), default=0) == 0:
+                        a["live_readers"] = old_val
+                        _recompute_urgency_score(a)
 
         # Adobe Live-Reader-Enrichment: im Hintergrund
         if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
