@@ -319,8 +319,18 @@ def fetch_top_article_urls(
     headline_entries = [(page_id, headline, _headline_words(headline))
                         for page_id, headline in id_to_headline.items()]
 
+    def _title_from_slug(path: str) -> str:
+        """Fallback-Titel aus URL-Slug wenn kein evar220-Match."""
+        last = path.rstrip("/").split("/")[-1]
+        # Trailing IDs entfernen: -6a17... oder -6a16b etc.
+        clean = _re.sub(r"-[0-9a-f]{5,}[^a-z]*$", "", last)
+        clean = _re.sub(r"\.html$", "", clean)
+        clean = clean.replace("-", " ").replace("_", " ").strip()
+        return clean[:1].upper() + clean[1:] if clean else ""
+
     def _best_headline(path: str) -> tuple[str, str]:
-        """Gibt (page_id, headline) mit bestem Slug-Wort-Match zurück."""
+        """Gibt (page_id, headline) mit bestem Slug-Wort-Match zurück.
+        Fallback: lesbarer Titel aus URL-Slug."""
         # Direkter ID-Match zuerst
         m = _ID_RE.search(path)
         if m:
@@ -329,17 +339,19 @@ def fetch_top_article_urls(
                 return m.group(1), direct
         # Wort-Matching zwischen URL-Slug und Headline
         slug_w = _slug_words(path)
-        if not slug_w:
-            return "", ""
-        best_id, best_hl, best_score = "", "", 0
-        for pid, hl, hl_words in headline_entries:
-            if not hl_words:
-                continue
-            overlap = len(slug_w & hl_words)
-            if overlap >= 3 and overlap > best_score:
-                best_score = overlap
-                best_id, best_hl = pid, hl
-        return best_id, best_hl
+        if slug_w:
+            best_id, best_hl, best_score = "", "", 0
+            for pid, hl, hl_words in headline_entries:
+                if not hl_words:
+                    continue
+                overlap = len(slug_w & hl_words)
+                if overlap >= 3 and overlap > best_score:
+                    best_score = overlap
+                    best_id, best_hl = pid, hl
+            if best_hl:
+                return best_id, best_hl
+        # Fallback: Titel aus URL-Slug generieren
+        return "", _title_from_slug(path)
 
     # Deduplizierung: m.bild.de (82 Zeichen Pfad) vs www.bild.de (80 Zeichen Pfad)
     # → selber Artikel erscheint mit 2 unterschiedlich langen Truncations
