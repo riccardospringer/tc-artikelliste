@@ -724,18 +724,46 @@ _EDITORIAL_ONE_MODULE_LOCK = threading.Lock()
 _ADOBE_ENRICHMENT_RUNNING = threading.Event()
 
 
+import math as _math
+
+
+def _readers_score(live_r: int) -> float:
+    """Logarithmische Skalierung: differenziert von 0 bis 100 über den vollen Leserbereich.
+    0 Leser=0, ~100=10, ~1k=27, ~10k=53, ~50k=75, ~100k=85, ~500k=100
+    """
+    if live_r <= 0:
+        return 0.0
+    return min(100.0, _math.log10(live_r + 1) / _math.log10(500_001) * 100.0)
+
+
 def _recompute_urgency_score(article: dict[str, object]) -> None:
     """Urgency-Score nach live_readers-Update neu berechnen."""
     live_r = _safe_int(article.get("live_readers"), default=0)
     home_pos_raw = article.get("home_position")
     home_pos = _safe_int(home_pos_raw, default=0) if home_pos_raw is not None else None
-    home_score = max(0, 100 - (home_pos - 1) * 5) if home_pos else 0
-    readers_score = min(100, live_r / 100)
-    article["urgency_score"] = round(0.6 * home_score + 0.4 * readers_score)
+    home_score = max(0.0, 100.0 - (home_pos - 1) * 5.0) if home_pos else 0.0
+    r_score = _readers_score(live_r)
+    if home_pos:
+        article["urgency_score"] = round(0.6 * home_score + 0.4 * r_score)
+    else:
+        # Ohne Home-Position: rein readers-basiert, voller 0–100 Bereich
+        article["urgency_score"] = round(r_score)
+
+
+def _sort_articles_inplace(articles: list[dict[str, object]]) -> None:
+    """Sortiert nach: Home-Pos (aufsteigend) → Live-Leser (absteigend) → Score → Datum."""
+    def _key(a: dict[str, object]) -> tuple:
+        home = _safe_int(a.get("home_position"), default=0)
+        home_sort = home if home > 0 else 10 ** 9
+        readers = -_safe_int(a.get("live_readers"), default=0)
+        score = -_safe_int(a.get("urgency_score"), default=0)
+        pub = a.get("published_at") or ""
+        return (home_sort, readers, score, str(pub))
+    articles.sort(key=_key)
 
 
 def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
-    """Holt Live-Leser im Hintergrund und aktualisiert den Cache direkt."""
+    """Holt Live-Leser im Hintergrund und aktualisiert Cache + Sortierung."""
     if not _ADOBE_AVAILABLE:
         return
     try:
@@ -749,6 +777,8 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
                         if url in reader_map:
                             a["live_readers"] = reader_map[url]
                             _recompute_urgency_score(a)
+                    # Nach Enrichment neu sortieren
+                    _sort_articles_inplace(_CACHE_DATA)
     except Exception:
         pass
     finally:
@@ -820,12 +850,16 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
                 for a in old_cache if a.get("live_readers")
             }
             if old_readers:
+                changed = False
                 for a in data:
                     url = str(a.get("canonical_url", ""))
                     old_val = old_readers.get(url, 0)
                     if old_val > 0 and _safe_int(a.get("live_readers"), default=0) == 0:
                         a["live_readers"] = old_val
                         _recompute_urgency_score(a)
+                        changed = True
+                if changed:
+                    _sort_articles_inplace(data)
 
         # Adobe Live-Reader-Enrichment: im Hintergrund
         if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
