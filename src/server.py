@@ -827,6 +827,7 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
 
 def _enrich_adobe_articles_with_es(
     adobe_articles: list[dict[str, object]],
+    include_all_articles: bool = True,
 ) -> list[dict[str, object]]:
     """
     Reichert Adobe-Artikel mit Metadaten aus dem ES-Feed an.
@@ -836,6 +837,18 @@ def _enrich_adobe_articles_with_es(
     if not _ES_AVAILABLE:
         return adobe_articles
     es_articles = _es.fetch_articles()
+
+    # Ältere Artikel aus groups/1 für URL-Lookup dazuholen
+    if include_all_articles:
+        try:
+            all_es = _es.fetch_all_articles_for_lookup()
+            existing_ids = {a.get("document_id", "") for a in es_articles}
+            for a in all_es:
+                if a.get("document_id") and a["document_id"] not in existing_ids:
+                    es_articles.append(a)
+        except Exception:
+            pass
+
     if not es_articles:
         return adobe_articles
 

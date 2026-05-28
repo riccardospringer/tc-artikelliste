@@ -220,6 +220,41 @@ def fetch_articles() -> list[dict[str, Any]]:
     return out
 
 
+def fetch_all_articles_for_lookup() -> list[dict[str, Any]]:
+    """
+    Holt alle Artikel aus document-groups/1 die eine echte URL haben.
+    Nur für URL/Metadaten-Lookup — kein Paginierungs-Overhead.
+    Liefert [{document_id, canonical_url, source_url, title, published_at, workflow_status}]
+    """
+    if not _is_configured():
+        return []
+    token = _get_token()
+    docs = _fetch_group(token, 1)
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        live_url = str(doc.get("liveUrl") or "").strip()
+        if not live_url or "/cmsid/" in live_url:
+            continue  # keine echte URL → nutzlos für URL-Lookup
+        doc_id = str(doc.get("documentId") or "").strip()
+        from urllib.parse import urlparse
+        p = urlparse(live_url)
+        host = p.netloc.lower().replace("www.", "").replace("m.", "")
+        canonical = f"https://{host}{p.path.rstrip('/')}"
+        headline = _parse_text(doc.get("headline"))
+        kicker = _parse_text(doc.get("kicker"))
+        full_title = f"{kicker} – {headline}" if kicker and headline else (headline or kicker)
+        pub_date = str(doc.get("documentPublicationDate") or doc.get("modificationDate") or "")
+        out.append({
+            "document_id": doc_id,
+            "canonical_url": canonical,
+            "source_url": live_url,
+            "title": full_title,
+            "published_at": pub_date,
+            "workflow_status": "BILD+" if doc.get("premium") else "Frei",
+        })
+    return out
+
+
 def _fetch_group(token: str, group_id: int) -> list[dict[str, Any]]:
     feed_base = _ES_FEED_URL.rsplit("/document-groups/", 1)[0]
     url = f"{feed_base}/document-groups/{group_id}"
