@@ -223,6 +223,27 @@ _ARTICLE_PATH_PREFIXES = (
     "/leben-wissen/", "/ratgeber/", "/auto/", "/geld/", "/lifestyle/",
     "/bild-plus/", "/bildplus/",
 )
+# Slug-Patterns die Sektions-Seiten oder alte Formate anzeigen (keine echten Artikel)
+_SECTION_PAGE_PATTERNS = (
+    "startseite", "-home", "home-", "/home",  # Sektions-Startseiten
+)
+
+
+def _is_article_path(path: str) -> bool:
+    """Prüft ob der Pfad ein echter Artikel ist (keine Sektions-Seite)."""
+    last = path.rstrip("/").split("/")[-1]
+    # Alte .bild Format-IDs wie "16804710.bild"
+    if last.endswith(".bild") or last.endswith(".html.bild"):
+        return False
+    # Sehr kurze Slugs = wahrscheinlich Sektions-Seite
+    parts = [p for p in last.split("-") if len(p) > 2]
+    if len(parts) < 2:
+        return False
+    # Sektions-Startseite-Muster
+    lower = path.lower()
+    if any(p in lower for p in _SECTION_PAGE_PATTERNS):
+        return False
+    return True
 
 
 def fetch_top_article_urls(
@@ -267,6 +288,8 @@ def fetch_top_article_urls(
         if not path or path in _ARTICLE_PATH_EXCLUDES:
             continue
         if not any(path.startswith(p) for p in _ARTICLE_PATH_PREFIXES):
+            continue
+        if not _is_article_path(path):
             continue
         val = row.get("data", [0])
         pv = int(val[0]) if val and val[0] is not None else 0
@@ -367,7 +390,14 @@ def fetch_top_article_urls(
             for pid, hl, hl_words in headline_entries:
                 if not hl_words:
                     continue
-                overlap = len(slug_w & hl_words)
+                # Direkte Überlappung
+                direct = len(slug_w & hl_words)
+                # Compound-Wort: slug hat "luxusketten", headline hat "ketten" → endswith-Match
+                compound = sum(
+                    1 for s in slug_w for h in hl_words
+                    if len(h) >= 5 and s != h and s.endswith(h)
+                )
+                overlap = direct + compound
                 if overlap >= 2 and overlap > best_score:
                     best_score = overlap
                     best_id, best_hl = pid, hl
@@ -439,6 +469,71 @@ def fetch_top_article_urls(
             "published_at": pub_date,
             "workflow_status": "Frei",
         })
+    return out
+
+
+def fetch_premium_status(canonical_urls: list[str]) -> dict[str, str]:
+    """
+    Ermittelt BILD+/Frei Status für Artikel via evar20 (Page Premium Status).
+    Gibt {canonical_url: "BILD+"} für Premium-Artikel zurück.
+    Nicht enthaltene Artikel = "Frei" (Standardwert).
+    """
+    if not _is_configured() or not _is_mapping_complete():
+        return {}
+    now_ts = time.time()
+    start = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts - 24 * 3600))
+    end = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts))
+
+    # evar20 itemId für "true" (BILD+) holen
+    body_evar20 = {
+        "rsid": _ADOBE_RSID,
+        "globalFilters": [{"type": "dateRange", "dateRange": f"{start}/{end}"}],
+        "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
+        "dimension": "variables/evar20",
+        "settings": {"countRepeatInstances": True, "limit": 5, "nonesBehavior": "exclude-nones"},
+    }
+    evar20_result = _request("POST", "/reports?locale=de_DE", body_evar20)
+    premium_item_id = next(
+        (str(row.get("itemId", "")) for row in evar20_result.get("rows", [])
+         if str(row.get("value", "")).lower() in ("true", "1", "yes", "bild+", "premium")),
+        None,
+    )
+    if not premium_item_id:
+        return {}
+
+    # prop21 gefiltert nach evar20=true → BILD+-Artikel-URLs
+    body_premium = {
+        "rsid": _ADOBE_RSID,
+        "globalFilters": [
+            {"type": "dateRange", "dateRange": f"{start}/{end}"},
+            {"type": "breakdown", "dimension": "variables/evar20", "itemIds": [premium_item_id]},
+        ],
+        "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
+        "dimension": _ADOBE_ARTICLE_DIMENSION,
+        "settings": {"countRepeatInstances": True, "limit": 50000, "nonesBehavior": "exclude-nones"},
+    }
+    premium_result = _request("POST", "/reports?locale=de_DE", body_premium)
+    premium_paths: set[str] = set()
+    for row in premium_result.get("rows", []):
+        dim = (row.get("value") or "").strip()
+        if not dim or dim == "(Low Traffic)":
+            continue
+        path = _extract_path(dim)
+        if path and path != "/":
+            premium_paths.add(path)
+
+    out: dict[str, str] = {}
+    for canonical_url in canonical_urls:
+        path = _extract_path(canonical_url)
+        if not path:
+            continue
+        if path in premium_paths:
+            out[canonical_url] = "BILD+"
+            continue
+        for adobe_path in premium_paths:
+            if len(adobe_path) >= 50 and path.startswith(adobe_path):
+                out[canonical_url] = "BILD+"
+                break
     return out
 
 

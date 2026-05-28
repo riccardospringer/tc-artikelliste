@@ -810,11 +810,16 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
     try:
         urls = [a.get("canonical_url", "") for a in data if a.get("canonical_url")]
         home_map: dict[str, int] = {}
+        premium_map: dict[str, str] = {}
         try:
             home_map = _adobe.fetch_home_positions(urls)
         except Exception:
             pass
-        if home_map:
+        try:
+            premium_map = _adobe.fetch_premium_status(urls)
+        except Exception:
+            pass
+        if home_map or premium_map:
             with _CACHE_LOCK:
                 if _CACHE_DATA is not None:
                     for a in _CACHE_DATA:
@@ -825,6 +830,9 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
                             if "home" not in flags:
                                 flags.append("home")
                             a["source_flags"] = sorted(flags)
+                        # Premium-Status nur für Adobe-only Artikel (ES-Feed hat authoritative Daten)
+                        if url in premium_map and "es_feed" not in (a.get("source_flags") or []):
+                            a["workflow_status"] = premium_map[url]
                         _recompute_urgency_score(a)
                     _sort_articles_inplace(_CACHE_DATA)
     except Exception:
