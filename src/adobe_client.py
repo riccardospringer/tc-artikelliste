@@ -277,12 +277,14 @@ def fetch_top_article_urls(
     # Schritt 2: Titel aus evar220 (Page ID – Headline)
     id_to_headline: dict[str, str] = {}
     try:
+        # evar220 mit 24h-Fenster für mehr page_id-Matches (auch ältere Top-Artikel)
+        evar220_start = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts - 24 * 3600))
         body_evar220 = {
             "rsid": _ADOBE_RSID,
-            "globalFilters": [{"type": "dateRange", "dateRange": f"{start}/{end}"}],
+            "globalFilters": [{"type": "dateRange", "dateRange": f"{evar220_start}/{end}"}],
             "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
             "dimension": "variables/evar220",
-            "settings": {"countRepeatInstances": True, "limit": 500, "nonesBehavior": "exclude-nones"},
+            "settings": {"countRepeatInstances": True, "limit": 1000, "nonesBehavior": "exclude-nones"},
         }
         evar220_result = _request("POST", "/reports?locale=de_DE", body_evar220)
         for row in evar220_result.get("rows", []):
