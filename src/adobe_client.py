@@ -399,18 +399,20 @@ def fetch_top_article_urls(
             continue
         seen.add(canonical)
         _, title = _best_headline(path)
-        # Publikationsdatum aus MongoDB ObjectID (erste 4 Bytes = Unix-Timestamp)
-        import re as _id_re
+        # Publikationsdatum aus MongoDB ObjectID: erste 4 Bytes = Unix-Timestamp
+        # page_id (aus evar220) ist vollständig, URL-ID oft truncated → page_id bevorzugt
+        import datetime as _dt
         pub_date: str | None = None
-        id_match = _re.search(r"([0-9a-f]{24})", canonical)
-        if id_match:
-            try:
-                import datetime as _dt
-                ts = int(id_match.group(1)[:8], 16)
-                if 1600000000 < ts < 2000000000:  # plausible 2020-2033
-                    pub_date = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).isoformat()
-            except Exception:
-                pass
+        url_id_match = _re.search(r"([0-9a-f]{24})", canonical)
+        for id_src in [page_id, url_id_match.group(1) if url_id_match else ""]:
+            if len(id_src) >= 8:
+                try:
+                    ts = int(id_src[:8], 16)
+                    if 1600000000 < ts < 2000000000:  # 2020-2033
+                        pub_date = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).isoformat()
+                        break
+                except Exception:
+                    pass
 
         out.append({
             "canonical_url": canonical,
@@ -419,7 +421,7 @@ def fetch_top_article_urls(
             "home_position": None,
             "title": title,
             "published_at": pub_date,
-            "workflow_status": "Frei",  # Default für Adobe-Artikel ohne Premium-Info
+            "workflow_status": "Frei",
         })
     return out
 
