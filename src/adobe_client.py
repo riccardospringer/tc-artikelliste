@@ -298,6 +298,48 @@ def fetch_top_article_urls(
 
     import re as _re
     _ID_RE = _re.compile(r"([0-9a-f]{24})")
+    _STOP = {"die", "der", "das", "ein", "eine", "einen", "dem", "den", "des",
+             "und", "oder", "fuer", "mit", "von", "zu", "bei", "in", "an",
+             "auf", "im", "am", "aus", "hat", "ist", "es", "er", "sie",
+             "ich", "wir", "wie", "was", "wer", "so", "nach", "zum", "zur",
+             "auch", "nur", "noch", "jetzt", "schon", "sich", "als", "neue",
+             "neuen", "ueber", "vor", "nach", "ab", "this", "the", "a", "for"}
+
+    def _slug_words(path: str) -> set[str]:
+        last = path.rstrip("/").split("/")[-1]
+        raw = _re.sub(r"[0-9a-f]{8,}", "", last)
+        parts = [w for w in _re.split(r"[-_]", raw) if len(w) > 2 and w not in _STOP]
+        return set(parts)
+
+    def _headline_words(headline: str) -> set[str]:
+        words = _re.findall(r"[a-züäöß]{3,}", headline.lower())
+        return set(w for w in words if w not in _STOP)
+
+    # Headline-Word-Index für schnelles Matching
+    headline_entries = [(page_id, headline, _headline_words(headline))
+                        for page_id, headline in id_to_headline.items()]
+
+    def _best_headline(path: str) -> tuple[str, str]:
+        """Gibt (page_id, headline) mit bestem Slug-Wort-Match zurück."""
+        # Direkter ID-Match zuerst
+        m = _ID_RE.search(path)
+        if m:
+            direct = id_to_headline.get(m.group(1), "")
+            if direct:
+                return m.group(1), direct
+        # Wort-Matching zwischen URL-Slug und Headline
+        slug_w = _slug_words(path)
+        if not slug_w:
+            return "", ""
+        best_id, best_hl, best_score = "", "", 0
+        for pid, hl, hl_words in headline_entries:
+            if not hl_words:
+                continue
+            overlap = len(slug_w & hl_words)
+            if overlap >= 3 and overlap > best_score:
+                best_score = overlap
+                best_id, best_hl = pid, hl
+        return best_id, best_hl
 
     # Kanonisieren: bild.de ohne www/m
     out: list[dict[str, object]] = []
@@ -307,11 +349,7 @@ def fetch_top_article_urls(
         if canonical in seen:
             continue
         seen.add(canonical)
-        # Titel: 24hex-ID aus URL extrahieren → evar220 lookup
-        title = ""
-        m = _ID_RE.search(path)
-        if m:
-            title = id_to_headline.get(m.group(1), "")
+        _, title = _best_headline(path)
         out.append({
             "canonical_url": canonical,
             "source_url": path_to_sample_url.get(path, canonical),
