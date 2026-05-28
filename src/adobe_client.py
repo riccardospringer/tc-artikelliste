@@ -414,9 +414,17 @@ def fetch_top_article_urls(
                 except Exception:
                     pass
 
+        # source_url: CMS-ID-URL wenn page_id bekannt (umgeht truncated URL),
+        # sonst Adobe prop21 sample URL (vollständiger als kanonisierter Pfad)
+        if article_page_id:
+            source_url = f"https://www.bild.de/cmsid/{article_page_id}"
+        else:
+            sample = path_to_sample_url.get(path, "")
+            source_url = sample if sample else canonical
+
         out.append({
             "canonical_url": canonical,
-            "source_url": path_to_sample_url.get(path, canonical),
+            "source_url": source_url,
             "live_readers": pv,
             "home_position": None,
             "title": title,

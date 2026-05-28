@@ -873,6 +873,10 @@ def _enrich_adobe_articles_with_es(
                         break
         if es:
             adobe_ids_matched.add(es.get("document_id", ""))
+            # Vollständige URL aus ES-Feed übernehmen
+            if es.get("source_url") and "/cmsid/" not in es.get("source_url", ""):
+                a["source_url"] = es["source_url"]
+                a["canonical_url"] = es.get("canonical_url", a["canonical_url"])
             if not a.get("title") or str(a.get("title","")).strip() == "":
                 a["title"] = es.get("title", "")
             a["workflow_status"] = es.get("workflow_status", a.get("workflow_status", ""))
