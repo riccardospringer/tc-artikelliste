@@ -547,11 +547,14 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
         const readersHtml = adobeActive
           ? (readersVal != null ? Number(readersVal).toLocaleString('de-DE') : '<span style="color:#aaa">n.v.</span>')
           : '<span style="color:#aaa" title="Adobe Analytics nicht aktiv">n.v.</span>';
+        const titleLink = url
+          ? `<a href="${{esc(url)}}" target="_blank" rel="noopener">${{esc(title)}}</a>`
+          : esc(title);
         return `<tr class="${{isTop5 ? 'top5' : ''}}">
           <td class="rank">${{rank}}</td>
           <td class="score"><span class="score-badge ${{scoreClass(score)}}">${{score}}</span></td>
-          <td class="title"><a href="${{esc(url)}}" target="_blank" rel="noopener">${{esc(title)}}</a></td>
-          <td class="url"><a href="${{esc(url)}}" target="_blank" rel="noopener">${{esc(url)}}</a></td>
+          <td class="title">${{titleLink}}</td>
+          <td class="url" style="font-size:10px;color:#999;word-break:break-all">${{esc(url)}}</td>
           <td><span class="status-pill${{statusCls}}">${{esc(statusLabel)}}</span></td>
           <td class="readers">${{readersHtml}}</td>
           <td class="homepos">${{homeHtml}}</td>
