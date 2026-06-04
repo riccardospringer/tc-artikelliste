@@ -356,6 +356,9 @@ def build_index_html(*, ui_path: str, api_path: str, health_path: str, csv_path:
     td.ressort {{ min-width: 90px; }}
     td.published {{ min-width: 100px; font-size: 11px; color: #555; white-space: nowrap; }}
     td.sources {{ font-size: 10px; color: #888; }}
+    td.comment {{ max-width: 200px; font-size: 11px; color: #555; }}
+    td.paywall {{ text-align: center; min-width: 60px; }}
+    .paywall-badge {{ display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 700; background: #fff3e0; color: #7f4f00; }}
     .empty {{ text-align: center; padding: 40px; color: #888; }}
     .share-row {{ font-size: 11px; color: #ddd; display: flex; align-items: center; gap: 8px; }}
     .share-row a {{ color: #fff; }}
@@ -411,6 +414,8 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
           <th data-col="title">Titel<span class="sort-arrow"></span></th>
           <th data-col="url">URL<span class="sort-arrow"></span></th>
           <th data-col="workflow_status">Status<span class="sort-arrow"></span></th>
+          <th data-col="lean_comment">Kommentar<span class="sort-arrow"></span></th>
+          <th data-col="paywall_status">Paywall<span class="sort-arrow"></span></th>
           <th data-col="live_readers">Live-Leser<span class="sort-arrow"></span></th>
           <th data-col="home_position">Home-Pos.<span class="sort-arrow"></span></th>
           <th data-col="ressort">Ressort<span class="sort-arrow"></span></th>
@@ -539,6 +544,10 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
         const title = a.title || url;
         const statusCls = a.workflow_status ? '' : ' unknown';
         const statusLabel = a.workflow_status || 'unbekannt';
+        const paywall = a.paywall_status || '';
+        const paywallHtml = paywall ? `<span class="paywall-badge">${{esc(paywall)}}</span>` : '';
+        const commentRaw = a.lean_comment || '';
+        const commentShort = commentRaw.length > 60 ? commentRaw.slice(0, 60) + '\u2026' : commentRaw;
         const homeHtml = a.home_position != null
           ? `<span class="home-badge">Pos. ${{a.home_position}}</span>`
           : '<span style="color:#aaa">—</span>';
@@ -556,6 +565,8 @@ TC_HOME_SOURCE=https://intern.example.com/home/positions.json</pre>
           <td class="title">${{titleLink}}</td>
           <td class="url" style="font-size:10px;color:#999;word-break:break-all">${{esc(url)}}</td>
           <td><span class="status-pill${{statusCls}}">${{esc(statusLabel)}}</span></td>
+          <td class="comment" title="${{esc(commentRaw)}}">${{esc(commentShort)}}</td>
+          <td class="paywall">${{paywall ? `<span class="paywall-badge">${{esc(paywall)}}</span>` : ""}}</td>
           <td class="readers">${{readersHtml}}</td>
           <td class="homepos">${{homeHtml}}</td>
           <td class="ressort">${{esc(a.ressort || '')}}</td>
@@ -830,9 +841,9 @@ def _run_adobe_enrichment_async(data: list[dict[str, object]]) -> None:
                             if "home" not in flags:
                                 flags.append("home")
                             a["source_flags"] = sorted(flags)
-                        # Premium-Status nur für Adobe-only Artikel (ES-Feed hat authoritative Daten)
+                        # Paywall-Status (BILD+/Frei) aus Adobe — NICHT workflow_status
                         if url in premium_map and "es_feed" not in (a.get("source_flags") or []):
-                            a["workflow_status"] = premium_map[url]
+                            a["paywall_status"] = premium_map[url]
                         _recompute_urgency_score(a)
                     _sort_articles_inplace(_CACHE_DATA)
     except Exception:
@@ -866,10 +877,6 @@ def _enrich_adobe_articles_with_es(
             for a in all_es:
                 doc_id = a.get("document_id", "")
                 if doc_id and doc_id not in existing_ids:
-                    # Nicht mehr in groups/0 → redigiert (hat echte URL) oder zum verbauen
-                    if "/cmsid/" not in a.get("source_url", ""):
-                        a = dict(a)
-                        a["workflow_status"] = "redigiert"
                     es_articles.append(a)
         except Exception:
             pass
@@ -917,7 +924,14 @@ def _enrich_adobe_articles_with_es(
                 a["canonical_url"] = es.get("canonical_url", a["canonical_url"])
             if not a.get("title") or str(a.get("title","")).strip() == "":
                 a["title"] = es.get("title", "")
-            a["workflow_status"] = es.get("workflow_status", a.get("workflow_status", ""))
+            es_wf = es.get("workflow_status", "")
+            if es_wf:
+                a["workflow_status"] = es_wf
+            for _f in ("paywall_status", "lean_comment", "lean_workflow_status_raw",
+                       "lean_workflow_status_field", "lean_comment_field",
+                       "field_sources", "warnings", "has_real_slug"):
+                if _f in es:
+                    a[_f] = es[_f]
             a["ressort"] = es.get("ressort") or a.get("ressort", "")
             if not a.get("published_at"):
                 a["published_at"] = es.get("published_at")
@@ -988,9 +1002,9 @@ def _enrich_adobe_articles_with_rss(
                 if not a.get("published_at"):
                     pub = _parse_dt(str(rss_item.get("pubDate") or ""))
                     a["published_at"] = pub.isoformat() if pub else None
-                if not a.get("workflow_status"):
+                if not a.get("paywall_status"):
                     prem = str(rss_item.get("premium") or "").strip().lower()
-                    a["workflow_status"] = "BILD+" if prem == "true" else ("Frei" if prem == "false" else "")
+                    a["paywall_status"] = "BILD+" if prem == "true" else ("Frei" if prem == "false" else "")
                 if not a.get("ressort"):
                     a["ressort"] = _detect_ressort(canon)
                 a.setdefault("source_flags", [])
@@ -1000,8 +1014,6 @@ def _enrich_adobe_articles_with_rss(
                 # Kein RSS-Match: Ressort aus URL ableiten
                 if not a.get("ressort"):
                     a["ressort"] = _detect_ressort(canon)
-                if not a.get("workflow_status"):
-                    a["workflow_status"] = "Frei"  # Default für Adobe-only
                 a.setdefault("title", "")
                 a.setdefault("published_at", None)
                 a.setdefault("source_flags", ["adobe"])
@@ -1223,6 +1235,45 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(result)
             return
 
+        if route_path == "/api/debug/article":
+            if not _ES_AVAILABLE:
+                self._send_json({"error": "es_feed_not_available"}, status=503)
+                return
+            url_param = query.get("url", [""])[0].strip()
+            id_param = query.get("id", [""])[0].strip()
+            try:
+                raw_result = None
+                if id_param:
+                    raw_result = _es.fetch_raw_document_by_id(id_param)
+                elif url_param:
+                    raw_result = _es.fetch_raw_document_by_url(url_param)
+                if raw_result is None:
+                    self._send_json({"error": "not_found", "id": id_param, "url": url_param}, status=404)
+                    return
+                doc = raw_result["document"]
+                mapped = _es._map_document(doc, source_group=raw_result["source_group"])
+                self._send_json({
+                    "articleId": mapped["document_id"],
+                    "url": mapped["canonical_url"],
+                    "title": mapped["title"],
+                    "leanWorkflowStatusRaw": mapped["lean_workflow_status_raw"],
+                    "leanWorkflowStatusField": mapped["lean_workflow_status_field"],
+                    "editorialStatusLabel": mapped["workflow_status"],
+                    "paywall_status": mapped["paywall_status"],
+                    "leanCommentRaw": mapped["lean_comment_raw"],
+                    "leanComment": mapped["lean_comment"],
+                    "leanCommentField": mapped["lean_comment_field"],
+                    "fieldSources": mapped["field_sources"],
+                    "warnings": mapped["warnings"],
+                    "sourceGroup": mapped["source_group"],
+                    "hasRealSlug": mapped["has_real_slug"],
+                    "lastCheckedAt": mapped["last_checked_at"],
+                    "rawDocumentKeys": list(doc.keys()),
+                })
+            except Exception as exc:
+                self._send_json({"error": "lookup_failed", "message": str(exc)}, status=502)
+            return
+
         if route_path == "/api/export/csv":
             if NO_SOURCES_STATE:
                 self._send_json({"error": "no_real_sources", "message": "Keine echten Datenquellen konfiguriert. Bitte TC_RSS_SOURCE oder TC_ADOBE_SOURCE als HTTP-URL setzen."}, status=503)
@@ -1235,7 +1286,8 @@ class Handler(BaseHTTPRequestHandler):
             buf = io.StringIO()
             fieldnames = [
                 "rank", "urgency_score", "title", "canonical_url", "workflow_status",
-                "live_readers", "home_position", "ressort", "published_at", "source_flags", "cms_id",
+                "paywall_status", "lean_comment", "live_readers", "home_position",
+                "ressort", "published_at", "source_flags", "cms_id",
             ]
             writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\n")
             writer.writeheader()

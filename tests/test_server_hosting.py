@@ -123,7 +123,7 @@ def test_build_index_html_uses_injected_paths() -> None:
     assert 'id="copy-share-link"' in html
     assert "window.location.pathname" in html
     assert "new URL('api/articles', resolvedUiUrl)" in html
-    assert "fetch(resolvedApiUrl + suffix)" in html
+    assert "fetch(resolvedApiUrl + tabParam)" in html
 
 
 def test_parse_optional_port_handles_invalid_values() -> None:

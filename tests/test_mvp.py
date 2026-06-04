@@ -300,3 +300,98 @@ def test_filters_status_aliases_from_rss_xml(tmp_path) -> None:
     assert "https://bild.de/politik/test-xml-111111" not in urls
     assert "https://bild.de/politik/test-xml-222222" not in urls
     assert "https://bild.de/politik/test-xml-333333" in urls
+
+
+# ── ES-Feed-Client Unit Tests (kein Netzwerk) ─────────────────────────────────
+
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+import es_feed_client as _es_client
+
+
+def test_premium_not_workflow() -> None:
+    """premium=True darf NICHT workflow_status setzen — nur paywall_status."""
+    doc = {
+        "documentId": "abc123",
+        "liveUrl": "https://www.bild.de/news/test-premium-abc123",
+        "headline": "Test Premium",
+        "premium": True,
+    }
+    mapped = _es_client._map_document(doc, source_group=0)
+    assert mapped["paywall_status"] == "BILD+"
+    assert mapped["workflow_status"] == "", (
+        f"workflow_status darf nicht aus premium kommen, war: {mapped['workflow_status']!r}"
+    )
+    assert "workflow_status: kein Lean-Feld gefunden" in mapped["warnings"]
+
+
+def test_lean_status_passthrough() -> None:
+    """editorialStatus='freigegeben' muss als workflow_status durchkommen."""
+    doc = {
+        "documentId": "def456",
+        "liveUrl": "https://www.bild.de/politik/test-lean-def456",
+        "headline": "Test Lean Status",
+        "premium": False,
+        "editorialStatus": "freigegeben",
+    }
+    mapped = _es_client._map_document(doc, source_group=0)
+    assert mapped["workflow_status"] == "freigegeben"
+    assert mapped["lean_workflow_status_raw"] == "freigegeben"
+    assert mapped["lean_workflow_status_field"] == "editorialStatus"
+    assert mapped["paywall_status"] == "Frei"
+
+
+def test_lean_comment_extraction() -> None:
+    """leanComment muss korrekt extrahiert werden."""
+    doc = {
+        "documentId": "ghi789",
+        "liveUrl": "https://www.bild.de/news/test-comment-ghi789",
+        "headline": "Test Kommentar",
+        "leanComment": "Bitte noch kuerzen",
+    }
+    mapped = _es_client._map_document(doc, source_group=0)
+    assert mapped["lean_comment"] == "Bitte noch kuerzen"
+    assert mapped["lean_comment_field"] == "leanComment"
+
+
+def test_no_fallback_redigiert() -> None:
+    """Artikel ohne Lean-Status: workflow_status muss leer sein, nicht 'redigiert'."""
+    doc = {
+        "documentId": "jkl000",
+        "liveUrl": "https://www.bild.de/news/test-no-status-jkl000",
+        "headline": "Kein Status",
+    }
+    mapped = _es_client._map_document(doc, source_group=1)
+    assert mapped["workflow_status"] == ""
+    assert mapped["workflow_status"] != "redigiert"
+    assert mapped["workflow_status"] != "Frei"
+
+
+def test_normalize_label_unknown_passthrough() -> None:
+    """Unbekannte Status-Werte werden lowercased durchgereicht."""
+    assert _es_client._normalize_label("CUSTOM_STATUS") == "custom_status"
+    assert _es_client._normalize_label("") == ""
+    assert _es_client._normalize_label("freigegeben") == "freigegeben"
+    assert _es_client._normalize_label("to_build") == "zum verbauen"
+    assert _es_client._normalize_label("published") == "publiziert"
+
+
+def test_walk_nested_field() -> None:
+    """_walk_for_field findet tief verschachtelte Felder."""
+    doc = {"meta": {"lean": {"editorialStatus": "redigiert"}}}
+    text, path = _es_client._walk_for_field(doc, ["editorialStatus"])
+    assert text == "redigiert"
+    assert "editorialStatus" in path
+
+
+def test_premium_false_paywall() -> None:
+    """premium=False → paywall_status='Frei', workflow_status=''."""
+    doc = {
+        "documentId": "xyz999",
+        "liveUrl": "https://www.bild.de/news/test-free-xyz999",
+        "headline": "Freier Artikel",
+        "premium": False,
+    }
+    mapped = _es_client._map_document(doc, source_group=0)
+    assert mapped["paywall_status"] == "Frei"
+    assert mapped["workflow_status"] == ""

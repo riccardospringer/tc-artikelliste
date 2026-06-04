@@ -1,23 +1,25 @@
 """
-Editorial Suite JSON-Feed Client für TC-Artikelliste.
+Editorial Suite JSON-Feed Client fuer TC-Artikelliste.
+
+Datenkorrektheit hat absolute Prioritaet:
+- Premium ist KEIN Workflow-Status (paywall_status getrennt).
+- Workflow-Status wird ausschliesslich aus echten Lean-Feldern gelesen.
+- Wenn kein Lean-Feld existiert: workflow_status = "" -> UI zeigt unbekannt.
+- Kein Raten, keine URL-Heuristik, keine Fallbacks zwischen unverwandten Quellen.
 
 ENV-Vars:
-  ES_CLIENT_ID      – OAuth2 Client ID
-  ES_CLIENT_SECRET  – OAuth2 Client Secret (niemals loggen)
-  ES_API_KEY        – x-api-key Header
-  ES_TOKEN_URL      – OAuth2 Token-Endpoint
-  ES_FEED_URL       – Feed-Endpoint
+  ES_CLIENT_ID         - OAuth2 Client ID
+  ES_CLIENT_SECRET     - OAuth2 Client Secret (niemals loggen)
+  ES_API_KEY           - x-api-key Header
+  ES_TOKEN_URL         - OAuth2 Token-Endpoint
+  ES_FEED_URL          - Feed-Endpoint (document-groups/0)
+  ES_STATUS_FIELDS     - Komma-Liste zusaetzlicher Lean-Status-Feldnamen
+  ES_COMMENT_FIELDS    - Komma-Liste zusaetzlicher Lean-Kommentar-Feldnamen
 """
 from __future__ import annotations
-
-import json
-import os
-import ssl
-import threading
-import time
-import urllib.parse
-import urllib.request
-from typing import Any
+import json, os, ssl, threading, time, urllib.parse, urllib.request
+from typing import Any, Callable, Iterable
+from urllib.parse import urlparse
 
 try:
     import certifi
@@ -28,14 +30,73 @@ except ImportError:
 _ES_CLIENT_ID = os.environ.get("ES_CLIENT_ID", "").strip()
 _ES_CLIENT_SECRET = os.environ.get("ES_CLIENT_SECRET", "").strip()
 _ES_API_KEY = os.environ.get("ES_API_KEY", "").strip()
-_ES_TOKEN_URL = os.environ.get(
-    "ES_TOKEN_URL",
-    "https://json-feeds-auth.prd.as.editorialsuite.io/oauth2/token",
-).strip()
-_ES_FEED_URL = os.environ.get(
-    "ES_FEED_URL",
-    "https://json-feeds.prd.as.editorialsuite.io/feed-api/v1/tenants/bild/feeds/rhehKDE0XWPOmSDlQxCk/document-groups/0",
-).strip()
+_ES_TOKEN_URL = os.environ.get("ES_TOKEN_URL", "https://json-feeds-auth.prd.as.editorialsuite.io/oauth2/token").strip()
+_ES_FEED_URL = os.environ.get("ES_FEED_URL", "https://json-feeds.prd.as.editorialsuite.io/feed-api/v1/tenants/bild/feeds/rhehKDE0XWPOmSDlQxCk/document-groups/0").strip()
+
+_DEFAULT_STATUS_FIELDS: tuple[str, ...] = (
+    "editorialStatus", "editorial_status",
+    "workflowStatus", "workflow_status",
+    "workflowState", "workflow_state",
+    "documentStatus", "document_status",
+    "publicationStatus", "publication_status",
+    "publishingStatus", "publishing_status",
+    "leanStatus", "lean_status",
+    "leanWorkflowStatus", "lean_workflow_status",
+    "redactionStatus", "redaction_status",
+    "redaktionStatus", "redaktions_status", "redaktionsStatus",
+    "stateLabel", "state_label",
+    "status", "state",
+)
+
+_DEFAULT_COMMENT_FIELDS: tuple[str, ...] = (
+    "editorialNote", "editorial_note",
+    "editorialComment", "editorial_comment",
+    "documentNote", "document_note",
+    "documentComment", "document_comment",
+    "internalNote", "internal_note",
+    "internalComment", "internal_comment",
+    "redactionalNote", "redactional_note",
+    "redaktionsHinweis", "redaktion_hinweis",
+    "redaktion_kommentar", "redaktionsKommentar",
+    "leanComment", "lean_comment",
+    "leanNote", "lean_note",
+    "note", "notes", "comment", "kommentar", "remark", "remarks", "memo",
+)
+
+
+def _env_field_list(env_name: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return defaults
+    extra = tuple(p.strip() for p in raw.split(",") if p.strip())
+    seen: set[str] = set()
+    merged: list[str] = []
+    for name in (*extra, *defaults):
+        if name and name not in seen:
+            seen.add(name)
+            merged.append(name)
+    return tuple(merged)
+
+
+_STATUS_FIELD_CANDIDATES: tuple[str, ...] = _env_field_list("ES_STATUS_FIELDS", _DEFAULT_STATUS_FIELDS)
+_COMMENT_FIELD_CANDIDATES: tuple[str, ...] = _env_field_list("ES_COMMENT_FIELDS", _DEFAULT_COMMENT_FIELDS)
+
+_STATUS_LABEL_MAP: dict[str, str] = {
+    "published": "publiziert", "publiziert": "publiziert",
+    "veroeffentlicht": "publiziert", "live": "publiziert", "online": "publiziert",
+    "freigegeben": "freigegeben", "released": "freigegeben", "approved": "freigegeben",
+    "redigiert": "redigiert", "edited": "redigiert",
+    "review": "review", "reviewed": "review", "in_review": "review",
+    "draft": "draft", "entwurf": "draft",
+    "writing": "in arbeit", "in_writing": "in arbeit",
+    "in_work": "in arbeit", "in_arbeit": "in arbeit", "in_progress": "in arbeit",
+    "to_build": "zum verbauen", "tobuild": "zum verbauen",
+    "zum_verbauen": "zum verbauen", "zumverbauen": "zum verbauen",
+    "zu_verbauen": "zum verbauen",
+    "scheduled": "geplant", "geplant": "geplant",
+    "archived": "archiviert", "archiviert": "archiviert",
+    "deleted": "geloescht", "geloescht": "geloescht",
+}
 
 _token_lock = threading.Lock()
 _token_cache: dict[str, Any] = {"token": "", "expires_at": 0.0}
@@ -63,6 +124,8 @@ def get_status() -> dict[str, Any]:
         "esTokenStatus": token_status,
         "esLastError": _last_error or None,
         "esLastSuccessfulRequestAt": _last_success_ts or None,
+        "esStatusFieldCandidates": list(_STATUS_FIELD_CANDIDATES),
+        "esCommentFieldCandidates": list(_COMMENT_FIELD_CANDIDATES),
     }
 
 
@@ -106,10 +169,83 @@ def _get_token(force: bool = False) -> str:
             raise RuntimeError(f"ES Token-Fehler: {_last_error}") from exc
 
 
+def _coerce_text(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, (int, float, bool)):
+        return str(raw).strip()
+    if isinstance(raw, dict):
+        for key in ("plainText", "text", "value", "label", "name"):
+            val = raw.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+    if isinstance(raw, list):
+        for item in raw:
+            txt = _coerce_text(item)
+            if txt:
+                return txt
+        return ""
+    return str(raw).strip()
+
+
 def _parse_text(field: Any) -> str:
-    if isinstance(field, dict):
-        return (field.get("plainText") or "").strip()
-    return str(field or "").strip()
+    return _coerce_text(field)
+
+
+def _walk_for_field(
+    doc: Any,
+    field_names: Iterable[str],
+    max_depth: int = 4,
+) -> tuple[str, str]:
+    target = {name.lower() for name in field_names if name}
+    if not target:
+        return ("", "")
+    stack: list[tuple[Any, str, int]] = [(doc, "", 0)]
+    while stack:
+        node, path, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if not isinstance(key, str):
+                    continue
+                key_lc = key.lower()
+                sub_path = f"{path}.{key}" if path else key
+                if key_lc in target:
+                    text = _coerce_text(value)
+                    if text:
+                        return (text, sub_path)
+                if isinstance(value, (dict, list)) and depth < max_depth:
+                    stack.append((value, sub_path, depth + 1))
+        elif isinstance(node, list):
+            for idx, item in enumerate(node):
+                sub_path = f"{path}[{idx}]"
+                if isinstance(item, (dict, list)) and depth < max_depth:
+                    stack.append((item, sub_path, depth + 1))
+    return ("", "")
+
+
+def _normalize_label(raw: str) -> str:
+    if not raw:
+        return ""
+    norm = raw.strip().lower()
+    norm_key = norm.replace(" ", "_").replace("-", "_")
+    if norm_key in _STATUS_LABEL_MAP:
+        return _STATUS_LABEL_MAP[norm_key]
+    if norm in _STATUS_LABEL_MAP:
+        return _STATUS_LABEL_MAP[norm]
+    return norm
+
+
+def _extract_lean_status(doc: dict[str, Any]) -> tuple[str, str]:
+    return _walk_for_field(doc, _STATUS_FIELD_CANDIDATES)
+
+
+def _extract_lean_comment(doc: dict[str, Any]) -> tuple[str, str]:
+    return _walk_for_field(doc, _COMMENT_FIELD_CANDIDATES)
 
 
 def _detect_ressort(channel_name: str) -> str:
@@ -120,53 +256,147 @@ def _detect_ressort(channel_name: str) -> str:
         "leben": "Leben & Wissen", "wissen": "Leben & Wissen",
         "regional": "Regional", "news": "News",
     }
-    lower = channel_name.lower()
+    lower = (channel_name or "").lower()
     for key, val in mapping.items():
         if key in lower:
             return val
     return channel_name or "News"
 
 
-def fetch_articles() -> list[dict[str, Any]]:
-    """
-    Holt aktuelle Artikel aus dem Editorial Suite JSON-Feed.
-    Gibt [] zurück wenn nicht konfiguriert — niemals Fake-Daten.
-    """
-    global _last_error, _last_success_ts
-    if not _is_configured():
-        return []
-    token = _get_token()
+def _canonical_url(live_url: str, doc_id: str = "") -> tuple[str, bool]:
+    if not live_url:
+        if doc_id:
+            return (f"https://bild.de/cmsid/{doc_id}", False)
+        return ("", False)
+    p = urlparse(live_url)
+    host = p.netloc.lower().replace("www.", "").replace("m.", "")
+    path = p.path.rstrip("/")
+    canonical = f"https://{host}{path}" if host else live_url
+    has_real_slug = "/cmsid/" not in live_url
+    return (canonical, has_real_slug)
+
+
+def _map_document(doc: dict[str, Any], *, source_group: int) -> dict[str, Any]:
+    doc_id = str(doc.get("documentId") or "").strip()
+    live_url = str(doc.get("liveUrl") or "").strip()
+    canonical, has_real_slug = _canonical_url(live_url, doc_id)
+
+    headline = _coerce_text(doc.get("headline"))
+    kicker = _coerce_text(doc.get("kicker"))
+    full_title = f"{kicker} – {headline}" if kicker and headline else (headline or kicker)
+
+    channel = doc.get("primaryChannel") or {}
+    channel_name = (channel.get("name", "") or "") if isinstance(channel, dict) else str(channel)
+    ressort = _detect_ressort(channel_name)
+
+    premium_raw = doc.get("premium")
+    has_premium_field = premium_raw is not None
+    paywall_status = ("BILD+" if bool(premium_raw) else "Frei") if has_premium_field else ""
+
+    lean_raw, lean_field = _extract_lean_status(doc)
+    workflow_status = _normalize_label(lean_raw)
+
+    comment_raw, comment_field = _extract_lean_comment(doc)
+
+    pub_date = str(
+        doc.get("documentPublicationDate")
+        or doc.get("displayDate")
+        or doc.get("modificationDate")
+        or ""
+    )
+
+    field_sources = {
+        "paywall_status": "premium" if has_premium_field else "",
+        "workflow_status": lean_field,
+        "lean_comment": comment_field,
+        "headline": "headline" if headline else "",
+        "kicker": "kicker" if kicker else "",
+        "channel": "primaryChannel" if channel_name else "",
+        "live_url": "liveUrl" if live_url else "",
+    }
+
+    warnings: list[str] = []
+    if not lean_field:
+        warnings.append("workflow_status: kein Lean-Feld gefunden")
+    if not has_real_slug:
+        warnings.append("live_url: keine echte Slug-URL (cmsid)")
+    if not doc_id:
+        warnings.append("documentId fehlt")
+
+    return {
+        "document_id": doc_id,
+        "canonical_url": canonical,
+        "source_url": live_url,
+        "cms_id": doc_id,
+        "title": full_title,
+        "headline": headline,
+        "kicker": kicker,
+        "workflow_status": workflow_status,
+        "paywall_status": paywall_status,
+        "lean_workflow_status_raw": lean_raw,
+        "lean_workflow_status_field": lean_field,
+        "lean_comment": comment_raw,
+        "lean_comment_raw": comment_raw,
+        "lean_comment_field": comment_field,
+        "field_sources": field_sources,
+        "warnings": warnings,
+        "live_readers": 0,
+        "home_position": None,
+        "published_at": pub_date,
+        "ressort": ressort,
+        "source_flags": ["es_feed"],
+        "urgency_score": 0,
+        "last_checked_at": time.time(),
+        "source_group": source_group,
+        "has_real_slug": has_real_slug,
+    }
+
+
+def _request_feed(url: str, token: str) -> dict[str, Any]:
     req = urllib.request.Request(
-        _ES_FEED_URL,
+        url,
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
             "x-api-key": _ES_API_KEY,
         },
     )
+    with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as resp:
+        data = json.loads(resp.read())
+    return data if isinstance(data, dict) else {"documents": data}
+
+
+def _fetch_group(token: str, group_id: int) -> list[dict[str, Any]]:
+    feed_base = _ES_FEED_URL.rsplit("/document-groups/", 1)[0]
+    url = f"{feed_base}/document-groups/{group_id}"
     try:
-        with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as resp:
-            data = json.loads(resp.read())
+        data = _request_feed(url, token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            new_token = _get_token(force=True)
+            data = _request_feed(url, new_token)
+        else:
+            raise
+    return data.get("documents", []) if isinstance(data, dict) else []
+
+
+def fetch_articles() -> list[dict[str, Any]]:
+    global _last_error, _last_success_ts
+    if not _is_configured():
+        return []
+    token = _get_token()
+    try:
+        documents = _fetch_group(token, 0)
         _last_success_ts = time.time()
         _last_error = ""
     except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            token = _get_token(force=True)
-            req.add_header("Authorization", f"Bearer {token}")
-            with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as resp:
-                data = json.loads(resp.read())
-            _last_success_ts = time.time()
-            _last_error = ""
-        else:
-            body = ""
-            try:
-                body = exc.read().decode("utf-8", errors="replace")[:200]
-            except Exception:
-                pass
-            _last_error = f"HTTP {exc.code}: {body}"
-            raise RuntimeError(f"ES Feed-Fehler: {_last_error}") from exc
-
-    documents = data.get("documents", []) if isinstance(data, dict) else data
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        _last_error = f"HTTP {exc.code}: {body}"
+        raise RuntimeError(f"ES Feed-Fehler: {_last_error}") from exc
     out: list[dict[str, Any]] = []
     for doc in documents:
         if not isinstance(doc, dict):
@@ -175,57 +405,11 @@ def fetch_articles() -> list[dict[str, Any]]:
         live_url = str(doc.get("liveUrl") or "").strip()
         if not doc_id and not live_url:
             continue
-
-        headline = _parse_text(doc.get("headline"))
-        kicker = _parse_text(doc.get("kicker"))
-        full_title = f"{kicker} – {headline}" if kicker and headline else (headline or kicker)
-
-        channel = doc.get("primaryChannel") or {}
-        if isinstance(channel, dict):
-            channel_name = channel.get("name", "")
-            channel_path = channel.get("path", [])
-        else:
-            channel_name = str(channel)
-            channel_path = []
-        ressort = _detect_ressort(channel_name)
-
-        premium = bool(doc.get("premium", False))
-        pub_date = str(doc.get("documentPublicationDate") or doc.get("displayDate") or "")
-
-        # Kanonische URL ableiten
-        from urllib.parse import urlparse
-        canonical = ""
-        if live_url:
-            p = urlparse(live_url)
-            host = p.netloc.lower().replace("www.", "").replace("m.", "")
-            path = p.path.rstrip("/")
-            canonical = f"https://{host}{path}"
-
-        out.append({
-            "document_id": doc_id,
-            "canonical_url": canonical,
-            "source_url": live_url,
-            "cms_id": doc_id,
-            "title": full_title,
-            "headline": headline,
-            "kicker": kicker,
-            "workflow_status": "BILD+" if premium else "Frei",
-            "live_readers": 0,
-            "home_position": None,
-            "published_at": pub_date,
-            "ressort": ressort,
-            "source_flags": ["es_feed"],
-            "urgency_score": 0,
-        })
+        out.append(_map_document(doc, source_group=0))
     return out
 
 
 def fetch_all_articles_for_lookup() -> list[dict[str, Any]]:
-    """
-    Holt alle Artikel aus document-groups/1 die eine echte URL haben.
-    Nur für URL/Metadaten-Lookup — kein Paginierungs-Overhead.
-    Liefert [{document_id, canonical_url, source_url, title, published_at, workflow_status}]
-    """
     if not _is_configured():
         return []
     token = _get_token()
@@ -234,95 +418,75 @@ def fetch_all_articles_for_lookup() -> list[dict[str, Any]]:
     for doc in docs:
         live_url = str(doc.get("liveUrl") or "").strip()
         if not live_url or "/cmsid/" in live_url:
-            continue  # keine echte URL → nutzlos für URL-Lookup
-        doc_id = str(doc.get("documentId") or "").strip()
-        from urllib.parse import urlparse
-        p = urlparse(live_url)
-        host = p.netloc.lower().replace("www.", "").replace("m.", "")
-        canonical = f"https://{host}{p.path.rstrip('/')}"
-        headline = _parse_text(doc.get("headline"))
-        kicker = _parse_text(doc.get("kicker"))
-        full_title = f"{kicker} – {headline}" if kicker and headline else (headline or kicker)
-        pub_date = str(doc.get("documentPublicationDate") or doc.get("modificationDate") or "")
-        out.append({
-            "document_id": doc_id,
-            "canonical_url": canonical,
-            "source_url": live_url,
-            "title": full_title,
-            "published_at": pub_date,
-            "workflow_status": "BILD+" if doc.get("premium") else "Frei",
-        })
+            continue
+        mapped = _map_document(doc, source_group=1)
+        if not mapped.get("source_url"):
+            continue
+        out.append(mapped)
     return out
 
 
-def _fetch_group(token: str, group_id: int) -> list[dict[str, Any]]:
-    feed_base = _ES_FEED_URL.rsplit("/document-groups/", 1)[0]
-    url = f"{feed_base}/document-groups/{group_id}"
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "x-api-key": _ES_API_KEY,
-    })
-    with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as resp:
-        data = json.loads(resp.read())
-    return data.get("documents", []) if isinstance(data, dict) else []
-
-
 def fetch_editing_articles() -> list[dict[str, Any]]:
-    """
-    Holt Artikel in Bearbeitung (nicht publiziert) aus document-groups/1.
-    Workflow-Status:
-      - liveUrl mit echtem Slug → 'redigiert' (bereit zum Publizieren)
-      - liveUrl mit /cmsid/ → 'zum verbauen' (noch in Arbeit)
-    Gibt [] zurück wenn nicht konfiguriert.
-    """
     if not _is_configured():
         return []
     token = _get_token()
     published_docs = _fetch_group(token, 0)
     all_docs = _fetch_group(token, 1)
     published_ids = {d.get("documentId") for d in published_docs if d.get("documentId")}
-
     out: list[dict[str, Any]] = []
     for doc in all_docs:
         doc_id = str(doc.get("documentId") or "").strip()
-        if doc_id in published_ids:
-            continue  # bereits publiziert → nicht im zweiten Tab
-        live_url = str(doc.get("liveUrl") or "").strip()
-        # Workflow-Status ableiten
-        if "/cmsid/" in live_url or not live_url:
-            workflow = "zum verbauen"
-            canonical = f"https://bild.de/cmsid/{doc_id}" if doc_id else ""
-        else:
-            workflow = "redigiert"
-            from urllib.parse import urlparse
-            p = urlparse(live_url)
-            host = p.netloc.lower().replace("www.", "").replace("m.", "")
-            path = p.path.rstrip("/")
-            canonical = f"https://{host}{path}"
-
-        headline = _parse_text(doc.get("headline"))
-        kicker = _parse_text(doc.get("kicker"))
-        full_title = f"{kicker} – {headline}" if kicker and headline else (headline or kicker)
-
-        channel = doc.get("primaryChannel") or {}
-        channel_name = channel.get("name", "") if isinstance(channel, dict) else str(channel)
-        ressort = _detect_ressort(channel_name)
-        premium = bool(doc.get("premium", False))
-        pub_date = str(doc.get("documentPublicationDate") or doc.get("modificationDate") or "")
-
-        out.append({
-            "document_id": doc_id,
-            "canonical_url": canonical,
-            "source_url": live_url,
-            "cms_id": doc_id,
-            "title": full_title,
-            "workflow_status": workflow,
-            "live_readers": 0,
-            "home_position": None,
-            "published_at": pub_date,
-            "ressort": ressort,
-            "source_flags": ["es_feed"],
-            "urgency_score": 0,
-        })
+        if doc_id and doc_id in published_ids:
+            continue
+        out.append(_map_document(doc, source_group=1))
     return out
+
+
+def fetch_raw_document_by_id(doc_id: str) -> dict[str, Any] | None:
+    target = (doc_id or "").strip()
+    if not target or not _is_configured():
+        return None
+    token = _get_token()
+    for group_id in (0, 1):
+        for doc in _fetch_group(token, group_id):
+            if str(doc.get("documentId") or "").strip() == target:
+                return {"document": doc, "source_group": group_id}
+    return None
+
+
+def fetch_raw_documents_by_predicate(
+    predicate: Callable[[dict[str, Any]], bool],
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    if not _is_configured():
+        return []
+    token = _get_token()
+    matches: list[dict[str, Any]] = []
+    for group_id in (0, 1):
+        for doc in _fetch_group(token, group_id):
+            try:
+                if predicate(doc):
+                    matches.append({"document": doc, "source_group": group_id})
+                    if limit is not None and len(matches) >= limit:
+                        return matches
+            except Exception:
+                continue
+    return matches
+
+
+def fetch_raw_document_by_url(url: str) -> dict[str, Any] | None:
+    target = (url or "").strip()
+    if not target or not _is_configured():
+        return None
+    target_canon, _ = _canonical_url(target)
+    target_lc = target_canon.lower()
+
+    def _matches(doc: dict[str, Any]) -> bool:
+        live = str(doc.get("liveUrl") or "").strip()
+        if not live:
+            return False
+        canon, _ = _canonical_url(live)
+        return canon.lower() == target_lc
+
+    results = fetch_raw_documents_by_predicate(_matches, limit=1)
+    return results[0] if results else None
