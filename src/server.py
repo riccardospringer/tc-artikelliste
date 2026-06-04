@@ -1274,6 +1274,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "lookup_failed", "message": str(exc)}, status=502)
             return
 
+        if route_path == "/api/debug/groups":
+            if not _ES_AVAILABLE:
+                self._send_json({"error": "es_feed_not_available"}, status=503)
+                return
+            id_param = query.get("id", ["6a1ff395639e3d502fd49be7"])[0].strip()
+            try:
+                max_group = int(query.get("max", ["15"])[0])
+            except ValueError:
+                max_group = 15
+            try:
+                self._send_json({
+                    "targetId": id_param,
+                    "feedMetadata": _es.fetch_feed_metadata(),
+                    "probe": _es.probe_document_groups(id_param, max_group=max_group),
+                })
+            except Exception as exc:
+                self._send_json({"error": "probe_failed", "message": str(exc)}, status=502)
+            return
+
         if route_path == "/api/export/csv":
             if NO_SOURCES_STATE:
                 self._send_json({"error": "no_real_sources", "message": "Keine echten Datenquellen konfiguriert. Bitte TC_RSS_SOURCE oder TC_ADOBE_SOURCE als HTTP-URL setzen."}, status=503)

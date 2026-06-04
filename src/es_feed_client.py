@@ -380,6 +380,103 @@ def _fetch_group(token: str, group_id: int) -> list[dict[str, Any]]:
     return data.get("documents", []) if isinstance(data, dict) else []
 
 
+def _feed_base() -> str:
+    return _ES_FEED_URL.rsplit("/document-groups/", 1)[0]
+
+
+def _request_raw(url: str, token: str) -> Any:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "x-api-key": _ES_API_KEY,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as resp:
+        return json.loads(resp.read())
+
+
+def _get_raw(url: str) -> dict[str, Any]:
+    """GET beliebige Feed-URL, liefert {ok, status, body|error}."""
+    if not _is_configured():
+        return {"ok": False, "status": None, "error": "not_configured"}
+    token = _get_token()
+    try:
+        return {"ok": True, "status": 200, "body": _request_raw(url, token)}
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            try:
+                return {"ok": True, "status": 200, "body": _request_raw(url, _get_token(force=True))}
+            except urllib.error.HTTPError as exc2:
+                return {"ok": False, "status": exc2.code, "error": _read_http_error(exc2)}
+        return {"ok": False, "status": exc.code, "error": _read_http_error(exc)}
+    except Exception as exc:
+        return {"ok": False, "status": None, "error": str(exc)}
+
+
+def _read_http_error(exc: "urllib.error.HTTPError") -> str:
+    try:
+        return exc.read().decode("utf-8", errors="replace")[:300]
+    except Exception:
+        return ""
+
+
+def fetch_feed_metadata() -> dict[str, Any]:
+    """Discovery: Feed-Stammdaten + document-groups-Index (mit Gruppennamen)."""
+    base = _feed_base()
+    return {
+        "feedBase": base,
+        "feed": _get_raw(base),
+        "documentGroupsIndex": _get_raw(f"{base}/document-groups"),
+    }
+
+
+def probe_document_groups(doc_id: str = "", max_group: int = 15) -> list[dict[str, Any]]:
+    """Discovery: Gruppen 0..max_group abfragen; je Gruppe Count, Ziel-Treffer, Sample-Keys."""
+    target = (doc_id or "").strip()
+    results: list[dict[str, Any]] = []
+    if not _is_configured():
+        return results
+    consecutive_failures = 0
+    for group_id in range(max_group + 1):
+        entry: dict[str, Any] = {"group": group_id}
+        try:
+            token = _get_token()
+            docs = _fetch_group(token, group_id)
+            entry["ok"] = True
+            entry["count"] = len(docs)
+            contains = False
+            sample_keys: set[str] = set()
+            target_doc_keys: list[str] | None = None
+            for doc in docs[:200]:
+                if not isinstance(doc, dict):
+                    continue
+                if len(sample_keys) < 60:
+                    sample_keys.update(k for k in doc.keys() if isinstance(k, str))
+                if target and str(doc.get("documentId") or "").strip() == target:
+                    contains = True
+                    target_doc_keys = sorted(k for k in doc.keys() if isinstance(k, str))
+            entry["contains_target"] = contains
+            entry["sample_keys"] = sorted(sample_keys)
+            if target_doc_keys is not None:
+                entry["target_doc_keys"] = target_doc_keys
+            consecutive_failures = 0
+        except urllib.error.HTTPError as exc:
+            entry["ok"] = False
+            entry["http_status"] = exc.code
+            entry["error"] = _read_http_error(exc)
+            consecutive_failures += 1
+        except Exception as exc:
+            entry["ok"] = False
+            entry["error"] = str(exc)
+            consecutive_failures += 1
+        results.append(entry)
+        if consecutive_failures >= 3:
+            break
+    return results
+
+
 def fetch_articles() -> list[dict[str, Any]]:
     global _last_error, _last_success_ts
     if not _is_configured():
