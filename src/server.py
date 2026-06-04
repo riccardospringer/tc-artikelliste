@@ -1299,10 +1299,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             rsid = query.get("rsid", [""])[0].strip() or None
             full = query.get("all", ["0"])[0] == "1"
+            values_param = query.get("values", [""])[0].strip()
             try:
-                payload: dict[str, object] = {"status": _adobe.find_status_dimensions(rsid)}
-                if full:
-                    payload["allDimensions"] = _adobe.list_dimensions(rsid)
+                payload: dict[str, object] = {}
+                if values_param:
+                    dims = [d for d in values_param.split(",") if d.strip()]
+                    try:
+                        hrs = int(query.get("hours", ["168"])[0])
+                    except ValueError:
+                        hrs = 168
+                    payload["dimensionValues"] = _adobe.probe_dimension_values(dims, hours=hrs)
+                else:
+                    payload["status"] = _adobe.find_status_dimensions(rsid)
+                    if full:
+                        payload["allDimensions"] = _adobe.list_dimensions(rsid)
                 self._send_json(payload)
             except Exception as exc:
                 self._send_json({"error": "dimensions_failed", "message": str(exc)}, status=502)

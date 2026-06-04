@@ -260,6 +260,43 @@ def find_status_dimensions(rsid: str | None = None) -> dict[str, Any]:
     return {"total": len(all_dims), "matches": matches}
 
 
+def probe_dimension_values(
+    dimension_ids: list[str],
+    hours: int = 168,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Liefert die tatsächlichen Werte je Dimension (Wertebereich-Beweis) — kein Filter."""
+    if not _is_configured() or not _is_mapping_complete():
+        return {"error": "not_configured"}
+    now_ts = time.time()
+    start = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts - hours * 3600))
+    end = time.strftime("%Y-%m-%dT%H:%M:%S.000", time.localtime(now_ts))
+    out: dict[str, Any] = {}
+    for dim in dimension_ids:
+        dim = dim.strip()
+        if not dim:
+            continue
+        body = {
+            "rsid": _ADOBE_RSID,
+            "globalFilters": [{"type": "dateRange", "dateRange": f"{start}/{end}"}],
+            "metricContainer": {"metrics": [{"columnId": "0", "id": _ADOBE_LIVE_READERS_METRIC}]},
+            "dimension": dim if dim.startswith("variables/") else f"variables/{dim}",
+            "settings": {"countRepeatInstances": True, "limit": limit, "nonesBehavior": "exclude-nones"},
+        }
+        try:
+            result = _request("POST", "/reports?locale=de_DE", body) or {}
+            values = []
+            for row in result.get("rows", []):
+                v = (row.get("value") or "").strip()
+                data = row.get("data", [0])
+                pv = int(data[0]) if data and data[0] is not None else 0
+                values.append({"value": v, "pageviews": pv})
+            out[dim] = {"ok": True, "values": values}
+        except Exception as exc:
+            out[dim] = {"ok": False, "error": str(exc)[:300]}
+    return out
+
+
 _ARTICLE_PATH_EXCLUDES = {"/adblockwall.html", "/", ""}
 _ARTICLE_PATH_PREFIXES = (
     "/news/", "/politik/", "/sport/", "/unterhaltung/", "/regional/",
