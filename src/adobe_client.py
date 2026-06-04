@@ -217,6 +217,49 @@ def get_report_suites() -> list[dict]:
     return result.get("content", [])
 
 
+def list_dimensions(rsid: str | None = None) -> list[dict]:
+    """Listet alle Dimensionen (eVars/props/Standard) der Report Suite — für Discovery."""
+    if not _is_configured():
+        return []
+    suite = (rsid or _ADOBE_RSID).strip()
+    path = f"/dimensions?rsid={urllib.parse.quote(suite)}&locale=de_DE&expansion=description,categories"
+    result = _request("GET", path) or []
+    if isinstance(result, dict):
+        result = result.get("content", result.get("dimensions", []))
+    out: list[dict] = []
+    for d in result if isinstance(result, list) else []:
+        if not isinstance(d, dict):
+            continue
+        out.append({
+            "id": d.get("id"),
+            "name": d.get("name"),
+            "title": d.get("title"),
+            "description": d.get("description"),
+            "category": d.get("category"),
+            "categories": d.get("categories"),
+        })
+    return out
+
+
+def find_status_dimensions(rsid: str | None = None) -> dict[str, Any]:
+    """Filtert Dimensionen nach Status-/Redaktions-Schlüsselwörtern — Workflow-Discovery."""
+    keywords = (
+        "status", "workflow", "redig", "redak", "edit", "anmerk",
+        "comment", "kommentar", "freigabe", "publish", "publiz", "lean",
+        "state", "stage", "phase",
+    )
+    all_dims = list_dimensions(rsid)
+    matches: list[dict] = []
+    for d in all_dims:
+        haystack = " ".join(
+            str(d.get(k) or "") for k in ("id", "name", "title", "description")
+        ).lower()
+        hit = [kw for kw in keywords if kw in haystack]
+        if hit:
+            matches.append({**d, "_matched": hit})
+    return {"total": len(all_dims), "matches": matches}
+
+
 _ARTICLE_PATH_EXCLUDES = {"/adblockwall.html", "/", ""}
 _ARTICLE_PATH_PREFIXES = (
     "/news/", "/politik/", "/sport/", "/unterhaltung/", "/regional/",
@@ -474,7 +517,6 @@ def fetch_top_article_urls(
             "home_position": None,
             "title": title,
             "published_at": pub_date,
-            "workflow_status": "Frei",
         })
     return out
 

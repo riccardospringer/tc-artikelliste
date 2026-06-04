@@ -1293,6 +1293,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "probe_failed", "message": str(exc)}, status=502)
             return
 
+        if route_path == "/api/debug/adobe-dimensions":
+            if not _ADOBE_AVAILABLE:
+                self._send_json({"error": "adobe_not_available"}, status=503)
+                return
+            rsid = query.get("rsid", [""])[0].strip() or None
+            full = query.get("all", ["0"])[0] == "1"
+            try:
+                payload: dict[str, object] = {"status": _adobe.find_status_dimensions(rsid)}
+                if full:
+                    payload["allDimensions"] = _adobe.list_dimensions(rsid)
+                self._send_json(payload)
+            except Exception as exc:
+                self._send_json({"error": "dimensions_failed", "message": str(exc)}, status=502)
+            return
+
         if route_path == "/api/export/csv":
             if NO_SOURCES_STATE:
                 self._send_json({"error": "no_real_sources", "message": "Keine echten Datenquellen konfiguriert. Bitte TC_RSS_SOURCE oder TC_ADOBE_SOURCE als HTTP-URL setzen."}, status=503)
