@@ -1283,12 +1283,19 @@ class Handler(BaseHTTPRequestHandler):
                 max_group = int(query.get("max", ["15"])[0])
             except ValueError:
                 max_group = 15
+            want_projection = query.get("projection", ["0"])[0] == "1"
             try:
-                self._send_json({
-                    "targetId": id_param,
-                    "feedMetadata": _es.fetch_feed_metadata(),
-                    "probe": _es.probe_document_groups(id_param, max_group=max_group),
-                })
+                if want_projection:
+                    self._send_json({
+                        "targetId": id_param,
+                        "projection": _es.probe_feed_projection(id_param),
+                    })
+                else:
+                    self._send_json({
+                        "targetId": id_param,
+                        "feedMetadata": _es.fetch_feed_metadata(),
+                        "probe": _es.probe_document_groups(id_param, max_group=max_group),
+                    })
             except Exception as exc:
                 self._send_json({"error": "probe_failed", "message": str(exc)}, status=502)
             return

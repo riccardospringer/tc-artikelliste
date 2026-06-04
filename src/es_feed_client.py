@@ -477,6 +477,88 @@ def probe_document_groups(doc_id: str = "", max_group: int = 15) -> list[dict[st
     return results
 
 
+_PROJECTION_PARAM_VARIANTS: tuple[str, ...] = (
+    "", "?fields=*", "?fields=all", "?projection=full", "?projection=all",
+    "?view=full", "?include=workflow", "?include=workflowStatus",
+    "?include=status", "?include=lean", "?expand=*", "?expand=all",
+    "?fieldSet=full", "?fieldSet=all", "?detail=full", "?full=true",
+)
+
+
+def probe_feed_projection(doc_id: str = "") -> dict[str, Any]:
+    """Discovery: testet Query-Param-Varianten + Schwester-Endpoints auf zusaetzliche Felder."""
+    target = (doc_id or "").strip()
+    if not _is_configured():
+        return {"error": "not_configured"}
+    base = _feed_base()
+    group0 = f"{base}/document-groups/0"
+
+    def _doc_keys(body: Any) -> tuple[int, list[str]]:
+        docs = body.get("documents", []) if isinstance(body, dict) else (body if isinstance(body, list) else [])
+        if not isinstance(docs, list):
+            return (0, [])
+        if target:
+            for d in docs:
+                if isinstance(d, dict) and str(d.get("documentId") or "").strip() == target:
+                    return (len(docs), sorted(k for k in d.keys() if isinstance(k, str)))
+        first = next((d for d in docs if isinstance(d, dict)), {})
+        return (len(docs), sorted(k for k in first.keys() if isinstance(k, str)))
+
+    # Baseline-Keys (ohne Param)
+    base_res = _get_raw(group0)
+    base_count, base_keys = _doc_keys(base_res.get("body")) if base_res.get("ok") else (0, [])
+    base_key_set = set(base_keys)
+
+    param_results: list[dict[str, Any]] = []
+    for variant in _PROJECTION_PARAM_VARIANTS:
+        url = group0 + variant
+        res = _get_raw(url)
+        entry: dict[str, Any] = {"param": variant or "(none)", "ok": res.get("ok"), "status": res.get("status")}
+        if res.get("ok"):
+            cnt, keys = _doc_keys(res.get("body"))
+            entry["doc_count"] = cnt
+            entry["new_keys"] = sorted(set(keys) - base_key_set)
+            entry["key_count"] = len(keys)
+        else:
+            entry["error"] = res.get("error")
+        param_results.append(entry)
+
+    # Schwester-Endpoints auf Feed-/Dokument-Ebene
+    sibling_urls = [
+        f"{base}",
+        f"{base}/schema",
+        f"{base}/fields",
+        f"{base}/configuration",
+        f"{base}/config",
+        f"{base}/metadata",
+    ]
+    if target:
+        sibling_urls += [
+            f"{base}/documents/{target}",
+            f"{base}/document-groups/0/documents/{target}",
+            f"{group0}/{target}",
+        ]
+    sibling_results: list[dict[str, Any]] = []
+    for url in sibling_urls:
+        res = _get_raw(url)
+        entry = {"url": url.replace(base, "{base}"), "ok": res.get("ok"), "status": res.get("status")}
+        if res.get("ok"):
+            body = res.get("body")
+            if isinstance(body, dict):
+                entry["top_keys"] = sorted(k for k in body.keys() if isinstance(k, str))[:40]
+        else:
+            entry["error"] = (res.get("error") or "")[:150]
+        sibling_results.append(entry)
+
+    return {
+        "baselineKeyCount": len(base_keys),
+        "baselineKeys": base_keys,
+        "baselineDocCount": base_count,
+        "paramVariants": param_results,
+        "siblingEndpoints": sibling_results,
+    }
+
+
 def fetch_articles() -> list[dict[str, Any]]:
     global _last_error, _last_success_ts
     if not _is_configured():
