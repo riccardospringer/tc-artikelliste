@@ -1082,39 +1082,16 @@ def load_excluded_articles() -> list[dict[str, object]]:
     return _CACHE_EXCLUDED
 
 
-def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
+def _refresh_cache_locked(force_refresh: bool = False) -> list[dict[str, object]]:
+    """Holt Daten und schreibt den Cache. Setzt voraus, dass _LOAD_IN_PROGRESS bereits
+    gehalten wird, und gibt diesen Lock am Ende IMMER frei (auch im Fehlerfall).
+    Liefert die neu geladenen Artikel."""
     global _CACHE_DATA, _CACHE_EXCLUDED, _CACHE_EXPIRES_AT
-
-    now = time.monotonic()
-    if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
-        return _CACHE_DATA
-
-    # Wenn bereits ein Ladevorgang läuft: sofort stale/leere Daten zurückgeben
-    # (verhindert, dass HTTP-Requests auf den Render-Proxy-Timeout von 5s warten)
-    if not _LOAD_IN_PROGRESS.acquire(blocking=False):
-        return _CACHE_DATA if _CACHE_DATA is not None else []
-
     try:
-        # Double-check nach Lock-Erwerb
-        now = time.monotonic()
-        if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
-            return _CACHE_DATA
-
-        # Dynamisch auswerten damit monkeypatching in Tests funktioniert.
-        _no_sources_now = (
-            not EDITORIAL_ONE_ENABLED
-            and _is_fixture(ADOBE_SOURCE)
-            and _is_fixture(RSS_SOURCE)
-            and not FIXTURE_MODE_EXPLICIT
-        )
-        if _no_sources_now:
-            return []
-
         _adobe_src = ADOBE_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(ADOBE_SOURCE)) else None
         _rss_src = RSS_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(RSS_SOURCE)) else None
         _home_src = HOME_SOURCE if (FIXTURE_MODE_EXPLICIT or not _is_fixture(HOME_SOURCE)) else None
 
-        # RSS-Fetch läuft ohne Cache-Lock — dauert >5s, darf andere Requests nicht blockieren
         data, excluded = _do_fetch_articles(force_refresh, _adobe_src, _rss_src, _home_src)
 
         # Alte live_readers-Werte aus dem Cache in neue Artikel übernehmen
@@ -1141,22 +1118,58 @@ def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
         if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
             if not _ADOBE_ENRICHMENT_RUNNING.is_set():
                 _ADOBE_ENRICHMENT_RUNNING.set()
-                t = threading.Thread(target=_run_adobe_enrichment_async, args=(data,), daemon=True)
-                t.start()
+                threading.Thread(
+                    target=_run_adobe_enrichment_async, args=(data,), daemon=True,
+                ).start()
 
         # Ergebnis in Cache schreiben
         with _CACHE_LOCK:
-            if CACHE_SECONDS > 0:
-                _CACHE_DATA = data
-                _CACHE_EXCLUDED = excluded
-                _CACHE_EXPIRES_AT = time.monotonic() + CACHE_SECONDS
-            else:
-                _CACHE_DATA = data
-                _CACHE_EXCLUDED = excluded
-                _CACHE_EXPIRES_AT = 0.0
+            _CACHE_DATA = data
+            _CACHE_EXCLUDED = excluded
+            _CACHE_EXPIRES_AT = (time.monotonic() + CACHE_SECONDS) if CACHE_SECONDS > 0 else 0.0
         return data
     finally:
         _LOAD_IN_PROGRESS.release()
+
+
+def load_articles(force_refresh: bool = False) -> list[dict[str, object]]:
+    now = time.monotonic()
+    if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
+        return _CACHE_DATA
+
+    # Wenn bereits ein Ladevorgang läuft: sofort stale/leere Daten zurückgeben
+    # (verhindert, dass HTTP-Requests auf den Render-Proxy-Timeout warten)
+    if not _LOAD_IN_PROGRESS.acquire(blocking=False):
+        return _CACHE_DATA if _CACHE_DATA is not None else []
+
+    # Lock gehalten. Ab hier gibt GENAU EIN Pfad den Lock wieder frei: entweder ein
+    # expliziter release() in einem Early-Return oder _refresh_cache_locked() (sync/bg).
+    now = time.monotonic()
+    if not force_refresh and CACHE_SECONDS > 0 and _CACHE_DATA is not None and now < _CACHE_EXPIRES_AT:
+        _LOAD_IN_PROGRESS.release()
+        return _CACHE_DATA
+
+    # Dynamisch auswerten damit monkeypatching in Tests funktioniert.
+    _no_sources_now = (
+        not EDITORIAL_ONE_ENABLED
+        and _is_fixture(ADOBE_SOURCE)
+        and _is_fixture(RSS_SOURCE)
+        and not FIXTURE_MODE_EXPLICIT
+    )
+    if _no_sources_now:
+        _LOAD_IN_PROGRESS.release()
+        return []
+
+    # Stale-while-revalidate: liegt bereits (veralteter) Cache vor und kein force_refresh,
+    # dann im Hintergrund aktualisieren und SOFORT die stale-Daten zurückgeben. So blockiert
+    # der auslösende Request nie auf der ~10–30s-Pipeline (bisher hing alle CACHE_SECONDS
+    # genau ein Request). Der BG-Thread gibt den Lock via _refresh_cache_locked frei.
+    if _CACHE_DATA is not None and not force_refresh:
+        threading.Thread(target=_refresh_cache_locked, args=(False,), daemon=True).start()
+        return _CACHE_DATA
+
+    # Cold-Start (noch kein Cache) oder erzwungener Refresh: synchron laden.
+    return _refresh_cache_locked(force_refresh)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1446,26 +1459,5 @@ if __name__ == "__main__":
     # → Eingehende /api/articles Requests erhalten sofort [] (kein Warten, kein 502)
     # → Sobald Preload fertig, wird Lock freigegeben und Cache ist warm.
     if not NO_SOURCES_STATE and _LOAD_IN_PROGRESS.acquire(blocking=False):
-        def _startup_preload_worker():
-            try:
-                _adobe_src = ADOBE_SOURCE if not _is_fixture(ADOBE_SOURCE) else None
-                _rss_src = RSS_SOURCE if not _is_fixture(RSS_SOURCE) else None
-                _home_src = HOME_SOURCE if not _is_fixture(HOME_SOURCE) else None
-                data, excluded = _do_fetch_articles(True, _adobe_src, _rss_src, _home_src)
-                with _CACHE_LOCK:
-                    global _CACHE_DATA, _CACHE_EXCLUDED, _CACHE_EXPIRES_AT
-                    _CACHE_DATA = data
-                    _CACHE_EXCLUDED = excluded
-                    _CACHE_EXPIRES_AT = time.monotonic() + (CACHE_SECONDS if CACHE_SECONDS > 0 else 0.0)
-                if _ADOBE_AVAILABLE and data and _adobe.get_adobe_status().get("adobeConfigured"):
-                    if not _ADOBE_ENRICHMENT_RUNNING.is_set():
-                        _ADOBE_ENRICHMENT_RUNNING.set()
-                        threading.Thread(
-                            target=_run_adobe_enrichment_async, args=(data,), daemon=True,
-                        ).start()
-            except Exception:
-                pass
-            finally:
-                _LOAD_IN_PROGRESS.release()
-        threading.Thread(target=_startup_preload_worker, daemon=True).start()
+        threading.Thread(target=_refresh_cache_locked, args=(True,), daemon=True).start()
     server.serve_forever()
